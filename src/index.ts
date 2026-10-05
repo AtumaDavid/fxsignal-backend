@@ -29,10 +29,13 @@ app.set('trust proxy', 1);
 // Local dev friendliness: the frontend may run on any localhost port (Vite
 // auto-increments when 5173 is taken). Always allow loopback origins plus the
 // explicitly configured FRONTEND_URL list; anything else is rejected.
+// The deployed web app is always allowed; FRONTEND_URL can add more
+// (comma-separated). Browsers send Origin without a trailing slash, so strip
+// one if it was pasted in.
+const PRODUCTION_ORIGINS = ['https://fxsignal-frontend.vercel.app'];
 const configuredOrigins = new Set(
-  (process.env.FRONTEND_URL ?? '')
-    .split(',')
-    .map((origin) => origin.trim())
+  [...PRODUCTION_ORIGINS, ...(process.env.FRONTEND_URL ?? '').split(',')]
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
     .filter(Boolean)
 );
 function isAllowedOrigin(origin: string | undefined): boolean {
