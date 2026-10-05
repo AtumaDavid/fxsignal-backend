@@ -40,6 +40,8 @@ import {
   analyzeTimeframe,
   buildDayTradeLevels,
   confluence,
+  enforceMinRewardRisk,
+  intradayConfluence,
   type Candle,
   type Confluence,
   type Timeframe,
@@ -245,9 +247,21 @@ interface DeterministicSignal {
   atrPips: number | null;
   price: number;
   confluence: Confluence;
+  /** Inputs to rebuild engine levels if the model review moves them badly. */
+  levelInputs: {
+    atr: number | null;
+    swingHigh: number | null;
+    swingLow: number | null;
+  };
 }
 
-const TF_ORDER: Timeframe[] = ['MONTHLY', 'WEEKLY', 'DAILY', 'H4', 'H1', 'M15'];
+/** Engine version recorded on rule-built signals. */
+const ENGINE_MODEL = 'ctx-h1-exec-v3';
+
+/** Intraday model: Daily + H4 context, H1 execution, M15 confirmation. */
+export const INTRADAY_TIMEFRAMES: Timeframe[] = ['DAILY', 'H4', 'H1', 'M15'];
+/** H1 bars that define the execution structure (stop placement). */
+const H1_STRUCTURE_BARS = 10;
 
 function catalystPenalty(events: LiveMarketEvent[], now: Date): number {
   const windowEnd = now.getTime() + 6 * 60 * 60 * 1000;
@@ -261,7 +275,7 @@ function catalystPenalty(events: LiveMarketEvent[], now: Date): number {
   return Math.min(20, penalty);
 }
 
-function buildDeterministicSignal(
+export function buildDeterministicSignal(
   pair: PairCode,
   mtf: MultiTimeframe,
   events: LiveMarketEvent[],
@@ -270,87 +284,106 @@ function buildDeterministicSignal(
   now: Date
 ): DeterministicSignal | null {
   const views: TimeframeView[] = [];
-  for (const tf of TF_ORDER) {
+  for (const tf of INTRADAY_TIMEFRAMES) {
     const candles = mtf[tf];
     if (!candles || candles.length < 5) continue;
     const view = analyzeTimeframe(pair, tf, candles);
     if (view) views.push(view);
   }
-  // Minimum viable context: a daily trend read + an intraday read.
-  const hasDaily = views.some((v) => v.timeframe === 'DAILY');
-  const hasIntraday = views.some(
-    (v) => v.timeframe === 'H1' || v.timeframe === 'M15'
+  const h1 = views.find((v) => v.timeframe === 'H1');
+  const hasContext = views.some(
+    (v) => v.timeframe === 'DAILY' || v.timeframe === 'H4'
   );
-  if (!hasDaily || !hasIntraday) return null;
+  if (!h1 || !hasContext) return null;
 
   const penalty = catalystPenalty(events, now);
-  const conf = confluence(views, penalty);
+  const conf = intradayConfluence(views, penalty);
   if (!conf) return null;
 
-  const fastView =
-    views.find((v) => v.timeframe === 'M15') ??
-    views.find((v) => v.timeframe === 'H1');
-  if (!fastView) return null;
-  const price = fastView.price;
-  const h1 = views.find((v) => v.timeframe === 'H1');
-  const atrValue = h1?.atr ?? fastView.atr;
-  const refHigh = h1?.swingHigh ?? fastView.swingHigh;
-  const refLow = h1?.swingLow ?? fastView.swingLow;
+  // Price from the confirmation timeframe (freshest), levels from H1.
+  const price = views.find((v) => v.timeframe === 'M15')?.price ?? h1.price;
+  const recentH1 = (mtf.H1 ?? []).slice(0, H1_STRUCTURE_BARS); // newest-first
+  const swingHigh = recentH1.length
+    ? Math.max(...recentH1.map((c) => c.high))
+    : h1.swingHigh;
+  const swingLow = recentH1.length
+    ? Math.min(...recentH1.map((c) => c.low))
+    : h1.swingLow;
 
-  const levels = buildDayTradeLevels(
+  let direction = conf.direction;
+  let levels = buildDayTradeLevels(
     pair,
-    conf.direction,
+    direction,
     price,
-    atrValue,
-    refHigh,
-    refLow
+    h1.atr,
+    swingHigh,
+    swingLow
   );
+  const notes = [...conf.notes];
+  if (!levels.tradeable) {
+    // Structure too wide for 1:2 — say so and stand aside instead of
+    // publishing a worse ratio.
+    notes.unshift(
+      levels.reason ?? 'Setup does not offer 1:2 — standing aside.'
+    );
+    direction = 'NEUTRAL';
+    levels = buildDayTradeLevels(
+      pair,
+      direction,
+      price,
+      h1.atr,
+      swingHigh,
+      swingLow
+    );
+  }
   const guarded = normalizeLevels({
     pairCode: pair,
-    direction: conf.direction,
+    direction,
     entryLow: levels.entryLow,
     entryHigh: levels.entryHigh,
     targetPrice: levels.targetPrice,
     invalidationPrice: levels.invalidationPrice,
   });
 
-  const dirWord =
-    conf.direction === 'LONG'
-      ? 'upside'
-      : conf.direction === 'SHORT'
-        ? 'downside'
-        : 'range';
+  const contextWord =
+    conf.score >= 15 ? 'bullish' : conf.score <= -15 ? 'bearish' : 'mixed';
   const voteWords = conf.votes
     .map(
-      (v) => `${v.timeframe.toLowerCase()} ${v.bias.toLowerCase()} (${v.score})`
+      (v) =>
+        `${v.timeframe === 'DAILY' ? 'daily' : v.timeframe} ${v.bias.toLowerCase()} (${v.score})`
     )
     .join(', ');
+  const risk = riskFor(guarded);
   const rationale =
-    `Top-down ${dirWord} read for day traders: ${voteWords}. ` +
-    `H1 ATR ${levels.atrPips ?? '—'} pips frames a ${levels.stopPips}-pip stop for a ${levels.targetPips}-pip target (${levels.riskReward}R). ` +
-    `${session} session — ${killzoneHint}`;
+    direction === 'NEUTRAL'
+      ? `No execution this window. Context (daily + H4) is ${contextWord}; ${notes[0] ?? ''} Votes: ${voteWords}.`
+      : `Daily + H4 context is ${contextWord}; H1 is the execution timeframe and M15 the confirmation. ` +
+        `Votes: ${voteWords}. Stop beyond the last ${H1_STRUCTURE_BARS} H1 bars' structure ` +
+        `(${risk.stopPips} pips) for a ${risk.targetPips}-pip target (${risk.riskReward}R). ${session} session — ${killzoneHint}`;
 
   const factors = [
-    ...conf.notes.slice(0, 3),
-    `Risk ${levels.stopPips}p / reward ${levels.targetPips}p (${levels.riskReward}R)`,
+    ...notes.slice(0, 4),
+    ...(direction === 'NEUTRAL'
+      ? []
+      : [
+          `Risk ${risk.stopPips}p / reward ${risk.targetPips}p (${risk.riskReward}R)`,
+        ]),
   ].slice(0, 5);
 
-  const stopRef =
-    conf.direction === 'SHORT'
-      ? `above ${guarded.invalidationPrice}`
-      : conf.direction === 'LONG'
-        ? `below ${guarded.invalidationPrice}`
-        : `outside ${guarded.entryLow}–${guarded.entryHigh}`;
+  const side = direction === 'LONG' ? 'long' : 'short';
   const playbook =
-    `${session} plan: trade the ${dirWord} bias only inside the entry zone ` +
-    `${guarded.entryLow}–${guarded.entryHigh}; invalidate ${stopRef} ` +
-    `(${levels.stopPips} pips), target ${guarded.targetPrice} (${levels.targetPips} pips, ${levels.riskReward}R). ` +
-    `Stand aside on a high-impact headline or if price chops mid-zone for over an hour.`;
+    direction === 'NEUTRAL'
+      ? `${session}: stand aside. Re-check when H1 realigns with the daily/H4 context, or at the next window.`
+      : `${session} plan: ${side} only, executed on H1 inside ${guarded.entryLow}–${guarded.entryHigh}. ` +
+        `Before entering, wait for an M15 candle to close in the ${side} direction inside the zone. ` +
+        `Invalidate ${direction === 'LONG' ? 'below' : 'above'} ${guarded.invalidationPrice} (${risk.stopPips}p); ` +
+        `target ${guarded.targetPrice} (${risk.targetPips}p, ${risk.riskReward}R). Skip it if a high-impact release lands before the trigger.`;
 
   return {
     pairCode: pair,
-    direction: conf.direction,
-    confidence: conf.confidence,
+    direction,
+    confidence:
+      direction === 'NEUTRAL' ? Math.min(conf.confidence, 45) : conf.confidence,
     entryLow: guarded.entryLow,
     entryHigh: guarded.entryHigh,
     targetPrice: guarded.targetPrice,
@@ -359,12 +392,13 @@ function buildDeterministicSignal(
     factors,
     playbook: playbook.slice(0, 600),
     votes: conf.votes,
-    stopPips: levels.stopPips,
-    targetPips: levels.targetPips,
-    riskReward: levels.riskReward,
+    stopPips: risk.stopPips,
+    targetPips: risk.targetPips,
+    riskReward: risk.riskReward,
     atrPips: levels.atrPips,
     price,
-    confluence: conf,
+    confluence: { ...conf, direction, notes },
+    levelInputs: { atr: h1.atr, swingHigh, swingLow },
   };
 }
 
@@ -415,10 +449,43 @@ function toPrediction(
   ai?: IntradayAiResult
 ): Prediction {
   const expiresAt = signalWindowEnd(now);
-  const entryLow = ai?.entryLow ?? signal.entryLow;
-  const entryHigh = ai?.entryHigh ?? signal.entryHigh;
-  const targetPrice = ai?.targetPrice ?? signal.targetPrice;
-  const invalidationPrice = ai?.invalidationPrice ?? signal.invalidationPrice;
+
+  // The model review may keep the engine's direction or downgrade it to
+  // NEUTRAL. It may not flip it, and it may not trade a window the engine
+  // stood aside on (H1 against the context, or no room for 1:2).
+  const aiUsable =
+    ai &&
+    signal.direction !== 'NEUTRAL' &&
+    (ai.direction === signal.direction || ai.direction === 'NEUTRAL')
+      ? ai
+      : undefined;
+  const direction = aiUsable?.direction ?? signal.direction;
+
+  // Levels: the model's, if they still give at least 1:2 after the
+  // guard-rails; otherwise the engine's (built for 2R by construction).
+  const engineLevels = {
+    pairCode: signal.pairCode,
+    direction,
+    entryLow: signal.entryLow,
+    entryHigh: signal.entryHigh,
+    targetPrice: signal.targetPrice,
+    invalidationPrice: signal.invalidationPrice,
+  };
+  const modelLevels =
+    aiUsable && direction !== 'NEUTRAL'
+      ? enforceMinRewardRisk(
+          normalizeLevels({
+            pairCode: signal.pairCode,
+            direction,
+            entryLow: aiUsable.entryLow,
+            entryHigh: aiUsable.entryHigh,
+            targetPrice: aiUsable.targetPrice,
+            invalidationPrice: aiUsable.invalidationPrice,
+          })
+        )
+      : null;
+  const { entryLow, entryHigh, targetPrice, invalidationPrice } =
+    modelLevels ?? engineLevels;
   const risk = riskFor({
     pairCode: signal.pairCode,
     entryLow,
@@ -426,13 +493,15 @@ function toPrediction(
     targetPrice,
     invalidationPrice,
   });
+  ai = aiUsable;
   return {
     id: '',
     pairCode: signal.pairCode,
     windowKey: windowKeyFor(now),
-    direction: ai?.direction ?? signal.direction,
-    engine,
-    modelName,
+    direction,
+    // Labelled by what actually shaped the published call.
+    engine: aiUsable ? engine : 'RULE_BASED',
+    modelName: aiUsable ? modelName : ENGINE_MODEL,
     confidence: ai
       ? Math.max(15, Math.min(92, ai.confidence))
       : signal.confidence,
@@ -565,7 +634,9 @@ async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
   }[] = [];
   for (const pair of pairs) {
     try {
-      const mtf = await fetchMultiTimeframe(pair);
+      // Only the four intraday timeframes: monthly/weekly are not needed here
+      // (and skipping them saves provider credits).
+      const mtf = await fetchMultiTimeframe(pair, INTRADAY_TIMEFRAMES);
       const signal = buildDeterministicSignal(
         pair,
         mtf,
@@ -621,7 +692,7 @@ async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
       signal,
       now,
       ai ? 'DEEPSEEK' : 'RULE_BASED',
-      ai ? modelName : 'mtf-confluence-v2',
+      ai ? modelName : ENGINE_MODEL,
       ai
     );
   });

@@ -280,7 +280,142 @@ export function confluence(
   return { direction, score, confidence, views, votes, notes };
 }
 
+// ---- Intraday model: context → execution → confirmation -----------------
+//
+// Daily and H4 set the direction (context). H1 is the execution timeframe:
+// it must not point against the context, and its volatility and structure
+// place the levels. M15 only confirms (or questions) the timing.
+
+/** Context weights: the daily trend leads, H4 refines. */
+const CONTEXT_WEIGHTS: Partial<Record<Timeframe, number>> = {
+  DAILY: 0.55,
+  H4: 0.45,
+};
+const DIRECTION_THRESHOLD = 15;
+
+export function intradayConfluence(
+  views: TimeframeView[],
+  catalystPenalty = 0
+): Confluence | null {
+  const byTf = (tf: Timeframe) => views.find((v) => v.timeframe === tf);
+  const daily = byTf('DAILY');
+  const h4 = byTf('H4');
+  const h1 = byTf('H1');
+  const m15 = byTf('M15');
+  const context = [daily, h4].filter((v): v is TimeframeView => Boolean(v));
+  if (context.length === 0 || !h1) return null;
+
+  // Weighted context score, renormalised if one of the two is missing.
+  const weightSum = context.reduce(
+    (a, v) => a + (CONTEXT_WEIGHTS[v.timeframe] ?? 0),
+    0
+  );
+  const score = Math.round(
+    context.reduce(
+      (a, v) => a + v.biasScore * (CONTEXT_WEIGHTS[v.timeframe] ?? 0),
+      0
+    ) / weightSum
+  );
+  let direction: Direction =
+    score >= DIRECTION_THRESHOLD
+      ? 'LONG'
+      : score <= -DIRECTION_THRESHOLD
+        ? 'SHORT'
+        : 'NEUTRAL';
+  const sign = direction === 'LONG' ? 1 : direction === 'SHORT' ? -1 : 0;
+  const agrees = (v?: TimeframeView) =>
+    Boolean(v) &&
+    sign !== 0 &&
+    Math.sign(v!.biasScore) === sign &&
+    Math.abs(v!.biasScore) >= DIRECTION_THRESHOLD;
+  const opposes = (v?: TimeframeView) =>
+    Boolean(v) &&
+    sign !== 0 &&
+    Math.sign(v!.biasScore) === -sign &&
+    Math.abs(v!.biasScore) >= DIRECTION_THRESHOLD;
+
+  const notes: string[] = [];
+  const contextAligned = Boolean(daily && h4) && agrees(daily) && agrees(h4);
+  if (daily && h4) {
+    notes.push(
+      daily.bias === h4.bias
+        ? `Context: daily and H4 both ${daily.bias.toLowerCase()}.`
+        : `Context split: daily ${daily.bias.toLowerCase()} vs H4 ${h4.bias.toLowerCase()} — size down.`
+    );
+  }
+
+  // Execution gate: never execute against the context on H1.
+  const h1Opposes = opposes(h1);
+  if (h1Opposes) {
+    notes.push(
+      `H1 is ${h1.bias.toLowerCase()} against the ${direction === 'LONG' ? 'bullish' : 'bearish'} context — stand aside until H1 realigns.`
+    );
+    direction = 'NEUTRAL';
+  } else if (sign !== 0) {
+    notes.push(
+      agrees(h1)
+        ? 'H1 execution aligned with the context.'
+        : 'H1 is flat — wait for an H1 push in the context direction before executing.'
+    );
+  }
+
+  // Confirmation: M15 adjusts confidence; it never sets direction.
+  const m15Confirms = agrees(m15);
+  const m15Against = opposes(m15);
+  if (direction !== 'NEUTRAL' && m15) {
+    notes.push(
+      m15Confirms
+        ? 'M15 confirms: momentum already in the trade direction.'
+        : m15Against
+          ? 'M15 not confirmed: wait for an M15 close back in the trade direction.'
+          : 'M15 neutral: wait for an M15 close in the trade direction.'
+    );
+  }
+  if (h1.rsi14 !== null && (h1.rsi14 >= 70 || h1.rsi14 <= 30)) {
+    notes.push(
+      h1.rsi14 >= 70
+        ? 'H1 RSI overbought — avoid chasing longs; prefer a pullback into the zone.'
+        : 'H1 RSI oversold — avoid chasing shorts; prefer a bounce into the zone.'
+    );
+  }
+  if (catalystPenalty > 0)
+    notes.push('High-impact catalyst in the window — confidence reduced.');
+
+  let confidence =
+    40 +
+    Math.min(22, Math.abs(score) * 0.3) +
+    (contextAligned ? 10 : 0) +
+    (agrees(h1) ? 10 : h1Opposes ? -10 : 0) +
+    (m15Confirms ? 6 : m15Against ? -6 : 0) -
+    catalystPenalty;
+  if (direction === 'NEUTRAL') confidence = Math.min(confidence, 45);
+  confidence = Math.max(15, Math.min(92, Math.round(confidence)));
+
+  const order: Timeframe[] = ['DAILY', 'H4', 'H1', 'M15'];
+  const ordered = order
+    .map((tf) => byTf(tf))
+    .filter((v): v is TimeframeView => Boolean(v));
+  return {
+    direction,
+    score,
+    confidence,
+    views: ordered,
+    votes: ordered.map((v) => ({
+      timeframe: v.timeframe,
+      bias: v.bias,
+      score: v.biasScore,
+    })),
+    notes,
+  };
+}
+
 // ---- Day-trade level construction ------------------------------------------
+
+/** Minimum reward:risk for every published signal, measured from the zone midpoint. */
+export const MIN_REWARD_RISK = 2;
+/** Largest stop (from the zone midpoint) that still leaves room for 2R inside the target cap. */
+export const MAX_RISK_PIPS = 60;
+export const MAX_TARGET_PIPS = 120;
 
 export interface DayTradeLevels {
   entryLow: number;
@@ -291,13 +426,42 @@ export interface DayTradeLevels {
   targetPips: number;
   riskReward: number;
   atrPips: number | null;
+  /** False when the H1 structure needs a stop too wide for 1:2 inside the target cap. */
+  tradeable: boolean;
+  /** Why the setup is not tradeable, when it isn't. */
+  reason: string | null;
+}
+
+/** Stop/target pips and R from the middle of the zone. */
+function measure(
+  pair: PairCode,
+  l: {
+    entryLow: number;
+    entryHigh: number;
+    targetPrice: number;
+    invalidationPrice: number;
+  }
+) {
+  const mid = (l.entryLow + l.entryHigh) / 2;
+  const stopPips = Number(toPips(pair, mid - l.invalidationPrice).toFixed(1));
+  const targetPips = Number(toPips(pair, l.targetPrice - mid).toFixed(1));
+  return {
+    stopPips,
+    targetPips,
+    riskReward: stopPips > 0 ? Number((targetPips / stopPips).toFixed(2)) : 0,
+  };
 }
 
 /**
- * Builds tradeable intraday levels from structure + volatility:
- * - entry zone anchored at the current price, sized ~0.25× ATR (clamped 6–30 pips);
- * - stop one ATR-fraction beyond structure (min 12 pips);
- * - target sized for R:R ≥ 1.5 (20–120 pips).
+ * H1 execution levels:
+ * - entry zone centred on the current price, sized from H1 ATR (8–28 pips wide);
+ * - invalidation beyond the recent H1 swing (+3 pips), at least 12 pips past
+ *   the near edge of the zone;
+ * - target at exactly MIN_REWARD_RISK × the risk, both measured from the zone
+ *   midpoint (rounded outward, so it never falls below 2R).
+ * If the structural stop is wider than MAX_RISK_PIPS, a 2R target would not
+ * fit in one window, so the setup is reported as not tradeable rather than
+ * squeezed into a worse ratio.
  */
 export function buildDayTradeLevels(
   pair: PairCode,
@@ -308,78 +472,108 @@ export function buildDayTradeLevels(
   swingLow: number | null
 ): DayTradeLevels {
   const pip = pipSize(pair);
-  const atrPips = atrValue !== null ? toPips(pair, atrValue) : 25;
+  const atrPips = atrValue !== null ? toPips(pair, atrValue) : 20;
   const zoneHalf = Math.min(Math.max(atrPips * 0.22, 4), 14) * pip;
+  const entryLow = roundToPip(pair, price - zoneHalf);
+  const entryHigh = roundToPip(pair, price + zoneHalf);
+  const mid = (entryLow + entryHigh) / 2;
+  const atrStop = Math.min(Math.max(atrPips * 0.6, 12), MAX_RISK_PIPS) * pip;
 
-  let entryLow = price - zoneHalf;
-  let entryHigh = price + zoneHalf;
-
-  const stopDist = Math.min(Math.max(atrPips * 0.55, 13), 70) * pip;
-  const minTarget = 20 * pip;
-  const maxTarget = 120 * pip;
-
-  let targetPrice: number;
   let invalidationPrice: number;
+  let targetPrice: number;
+  let reason: string | null = null;
 
-  if (direction === 'LONG') {
-    const structureStop =
-      swingLow !== null
-        ? Math.min(entryLow - 4 * pip, swingLow - 3 * pip)
-        : entryLow - stopDist;
-    invalidationPrice = Math.max(
-      entryLow - 80 * pip,
-      Math.min(entryLow - 12 * pip, structureStop, entryLow - stopDist)
-    );
-    const risk = Math.max(entryLow - invalidationPrice, 12 * pip);
-    targetPrice = Math.min(
-      entryHigh + maxTarget,
-      Math.max(entryHigh + minTarget, entryHigh + risk * 1.8)
-    );
-  } else if (direction === 'SHORT') {
-    const structureStop =
-      swingHigh !== null
-        ? Math.max(entryHigh + 4 * pip, swingHigh + 3 * pip)
-        : entryHigh + stopDist;
-    invalidationPrice = Math.min(
-      entryHigh + 80 * pip,
-      Math.max(entryHigh + 12 * pip, structureStop, entryHigh + stopDist)
-    );
-    const risk = Math.max(invalidationPrice - entryHigh, 12 * pip);
-    targetPrice = Math.max(
-      entryHigh - maxTarget,
-      Math.min(entryHigh - minTarget, entryHigh - risk * 1.8)
+  if (direction === 'LONG' || direction === 'SHORT') {
+    const long = direction === 'LONG';
+    const nearEdge = long ? entryLow : entryHigh;
+    const minStop = long ? nearEdge - 12 * pip : nearEdge + 12 * pip;
+    const structure =
+      long && swingLow !== null
+        ? swingLow - 3 * pip
+        : !long && swingHigh !== null
+          ? swingHigh + 3 * pip
+          : long
+            ? mid - atrStop
+            : mid + atrStop;
+    // Beyond structure and at least 12 pips past the zone.
+    invalidationPrice = long
+      ? Math.min(structure, minStop)
+      : Math.max(structure, minStop);
+    const riskPips = toPips(pair, mid - invalidationPrice);
+    if (riskPips > MAX_RISK_PIPS) {
+      reason = `The H1 stop would be ${riskPips.toFixed(0)} pips beyond structure — too wide for 1:${MIN_REWARD_RISK} inside one window.`;
+    }
+    invalidationPrice = roundToPip(pair, invalidationPrice);
+    const risk = Math.abs(mid - invalidationPrice);
+    const rewardDistance = Math.max(risk * MIN_REWARD_RISK, 20 * pip);
+    // Round the target outward so rounding can never cost reward.
+    const rawTarget = long ? mid + rewardDistance : mid - rewardDistance;
+    targetPrice = roundToPip(
+      pair,
+      long
+        ? Math.ceil(rawTarget / pip - 1e-9) * pip
+        : Math.floor(rawTarget / pip + 1e-9) * pip
     );
   } else {
-    // NEUTRAL: bracket the range — target toward the nearer range edge expansion.
-    invalidationPrice = entryLow - stopDist;
-    targetPrice =
-      entryHigh + Math.min(maxTarget, Math.max(minTarget, stopDist * 1.6));
+    // NEUTRAL: no trade; keep reference levels one ATR stop either side.
+    invalidationPrice = roundToPip(pair, mid - atrStop);
+    targetPrice = roundToPip(pair, mid + atrStop * MIN_REWARD_RISK);
   }
 
-  entryLow = roundToPip(pair, entryLow);
-  entryHigh = roundToPip(pair, entryHigh);
-  targetPrice = roundToPip(pair, targetPrice);
-  invalidationPrice = roundToPip(pair, invalidationPrice);
-
-  const stopPips =
-    direction === 'SHORT'
-      ? toPips(pair, invalidationPrice - entryHigh)
-      : toPips(pair, entryLow - invalidationPrice);
-  const targetPips =
-    direction === 'SHORT'
-      ? toPips(pair, entryLow - targetPrice)
-      : toPips(pair, targetPrice - entryHigh);
-  const riskReward =
-    stopPips > 0 ? Number((targetPips / stopPips).toFixed(2)) : 0;
-
+  const m = measure(pair, {
+    entryLow,
+    entryHigh,
+    targetPrice,
+    invalidationPrice,
+  });
   return {
     entryLow,
     entryHigh,
     targetPrice,
     invalidationPrice,
-    stopPips: Number(stopPips.toFixed(1)),
-    targetPips: Number(targetPips.toFixed(1)),
-    riskReward,
+    ...m,
     atrPips: atrValue !== null ? Number(atrPips.toFixed(1)) : null,
+    tradeable: reason === null,
+    reason,
   };
+}
+
+/**
+ * Enforces MIN_REWARD_RISK on externally supplied levels (the model review):
+ * pushes the target out to 2R from the zone midpoint when it is closer.
+ * Returns null when 2R cannot fit inside the target cap, so the caller can
+ * fall back to engine-built levels instead of publishing a worse ratio.
+ */
+export function enforceMinRewardRisk<
+  T extends {
+    pairCode: PairCode;
+    direction: Direction;
+    entryLow: number;
+    entryHigh: number;
+    targetPrice: number;
+    invalidationPrice: number;
+  },
+>(levels: T): T | null {
+  if (levels.direction === 'NEUTRAL') return levels;
+  const pair = levels.pairCode;
+  const pip = pipSize(pair);
+  const long = levels.direction === 'LONG';
+  const mid = (levels.entryLow + levels.entryHigh) / 2;
+  const risk = long
+    ? mid - levels.invalidationPrice
+    : levels.invalidationPrice - mid;
+  if (risk <= 0 || toPips(pair, risk) > MAX_RISK_PIPS) return null;
+  const minReward = risk * MIN_REWARD_RISK;
+  const reward = long ? levels.targetPrice - mid : mid - levels.targetPrice;
+  if (reward >= minReward - 1e-9) return levels;
+  const raw = long ? mid + minReward : mid - minReward;
+  const targetPrice = roundToPip(
+    pair,
+    long
+      ? Math.ceil(raw / pip - 1e-9) * pip
+      : Math.floor(raw / pip + 1e-9) * pip
+  );
+  if (toPips(pair, Math.abs(targetPrice - mid)) > MAX_TARGET_PIPS + 15)
+    return null;
+  return { ...levels, targetPrice };
 }

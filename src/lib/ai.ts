@@ -269,7 +269,8 @@ function compactMtfContext(
 ): string {
   return JSON.stringify({
     asOf: new Date().toISOString(),
-    style: 'intraday day-trading, 6-hour session window',
+    style:
+      'intraday: daily+H4 context, H1 execution, M15 confirmation, min 2R, 6-hour window',
     pairs: pairs.map((p) => ({
       pairCode: p.pairCode,
       currentPrice: p.price,
@@ -329,7 +330,7 @@ export async function requestIntradayAnalysis(
     {
       role: 'system',
       content:
-        'You are a disciplined FX day-trading desk analyst for EUR/USD and USD/JPY. Respect the supplied deterministic multi-timeframe confluence (it is computed from real EMA/RSI/ATR/structure) — agree with it unless the event risk or a clear intraday momentum divergence justifies a downgrade to NEUTRAL with lower confidence. Return JSON only with a predictions array (one object per pair). Never promise profits, never invent news, keep confidence an integer 15-92 representing signal confidence (not win probability). Levels must be realistic spot FX (EUR/USD pip 0.0001, USD/JPY pip 0.01): entry zone 6-30 pips wide around the current price, stop/invalidation 12-70 pips beyond the entry zone opposite the trade, target sized for reward:risk >= 1.5 (20-120 pips beyond entry in the trade direction, never inside the zone). Also include a 1-2 sentence session playbook: which killzone to trade, where to enter, what invalidates, and when to stand aside.',
+        'You are a disciplined FX day-trading desk analyst for EUR/USD and USD/JPY. The trading model is fixed: the DAILY and H4 timeframes set the context (direction); H1 is the execution timeframe (entry zone, stop beyond the recent H1 swing); M15 is confirmation only (it can raise or lower confidence, never set direction). Respect the supplied deterministic confluence, which is computed from real EMA/RSI/ATR/structure on exactly those timeframes. You may keep its direction or downgrade to NEUTRAL (for example when event risk is high); never flip it, and never trade when it is NEUTRAL. Return JSON only with a predictions array (one object per pair). Never promise profits, never invent news; confidence is an integer 15-92 representing signal confidence, not win probability. Levels must be realistic spot FX (EUR/USD pip 0.0001, USD/JPY pip 0.01): entry zone 8-28 pips wide around the current price; stop beyond the recent H1 structure, 12-60 pips from the middle of the zone; target measured from the middle of the zone at AT LEAST 2x the stop distance (reward:risk >= 2.0, never less). Also include a 1-2 sentence session playbook: execute on H1 inside the zone, wait for an M15 close in the trade direction, what invalidates, and when to stand aside.',
     },
     {
       role: 'user',

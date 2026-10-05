@@ -157,9 +157,9 @@ export async function fetchTimeframeCandles(
  * treats the rest as optional context).
  */
 export async function fetchMultiTimeframe(
-  pairCode: PairCode
+  pairCode: PairCode,
+  timeframes: Timeframe[] = Object.keys(TF_CONFIG) as Timeframe[]
 ): Promise<MultiTimeframe> {
-  const timeframes = Object.keys(TF_CONFIG) as Timeframe[];
   const entries = await Promise.all(
     timeframes.map(async (timeframe) => {
       try {
@@ -176,7 +176,11 @@ export async function fetchMultiTimeframe(
       }
     })
   );
-  return Object.fromEntries(entries) as MultiTimeframe;
+  // Timeframes not requested come back empty.
+  const empty = Object.fromEntries(
+    (Object.keys(TF_CONFIG) as Timeframe[]).map((tf) => [tf, [] as Candle[]])
+  );
+  return { ...empty, ...Object.fromEntries(entries) } as MultiTimeframe;
 }
 
 function dateOnly(date: Date) {
