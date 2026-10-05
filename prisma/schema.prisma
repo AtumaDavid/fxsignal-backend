@@ -1,0 +1,181 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Direction {
+  LONG
+  SHORT
+  NEUTRAL
+}
+
+enum OutcomeStatus {
+  PENDING
+  HIT
+  MISSED
+  EXPIRED
+}
+
+enum OutcomeSource {
+  DEMO
+  LIVE
+}
+
+enum EventImpact {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum PredictionEngine {
+  RULE_BASED
+  DEEPSEEK
+}
+
+model User {
+  id               Int         @id @default(autoincrement())
+  email            String      @unique
+  name             String
+  passwordHash     String
+  plan             String      @default("FREE")
+  planStatus       String      @default("ACTIVE")
+  stripeCustomerId String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @default(now()) @updatedAt
+  trades           UserTrade[]
+
+  @@index([email])
+}
+
+model CurrencyPair {
+  code          String       @id
+  displayName   String
+  baseCurrency  String
+  quoteCurrency String
+  pipSize       Decimal      @db.Decimal(10, 6)
+  isActive      Boolean      @default(true)
+  createdAt     DateTime     @default(now())
+  predictions   Prediction[]
+}
+
+model Prediction {
+  id                Int                @id @default(autoincrement())
+  pairCode          String
+  windowKey         String
+  direction         Direction
+  engine            PredictionEngine   @default(RULE_BASED)
+  modelName         String?
+  confidence        Int
+  entryLow          Decimal            @db.Decimal(16, 6)
+  entryHigh         Decimal            @db.Decimal(16, 6)
+  targetPrice       Decimal            @db.Decimal(16, 6)
+  invalidationPrice Decimal            @db.Decimal(16, 6)
+  rationale         String
+  factors           Json
+  session           String
+  // Day-trader extensions (v2 engine). Nullable so historic rows stay valid.
+  playbook          String?
+  timeframeBias     Json?
+  stopPips          Decimal?           @db.Decimal(12, 2)
+  targetPips        Decimal?           @db.Decimal(12, 2)
+  riskReward        Decimal?           @db.Decimal(8, 2)
+  atrPips           Decimal?           @db.Decimal(12, 2)
+  validFrom         DateTime
+  expiresAt         DateTime
+  createdAt         DateTime           @default(now())
+  pair              CurrencyPair       @relation(fields: [pairCode], references: [code], onDelete: Cascade)
+  outcome           PredictionOutcome?
+  userTrades        UserTrade[]
+
+  @@unique([pairCode, windowKey])
+  @@index([pairCode, validFrom, expiresAt])
+  @@index([validFrom])
+}
+
+model PredictionOutcome {
+  id            Int           @id @default(autoincrement())
+  predictionId  Int           @unique
+  status        OutcomeStatus @default(PENDING)
+  resolvedPrice Decimal?      @db.Decimal(16, 6)
+  movementPips  Decimal?      @db.Decimal(12, 2)
+  evaluatedAt   DateTime?
+  source        OutcomeSource @default(DEMO)
+  note          String?
+  prediction    Prediction    @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+}
+
+model MarketEvent {
+  id            Int         @id @default(autoincrement())
+  externalId    String      @unique
+  currency      String
+  title         String
+  eventDate     DateTime
+  impact        EventImpact
+  forecast      String?
+  previousValue String?
+  createdAt     DateTime    @default(now())
+
+  @@index([eventDate])
+}
+
+enum WeeklyBias {
+  BULLISH
+  BEARISH
+  NEUTRAL
+}
+
+/**
+ * Weekend analysis for the coming trading week. One row per pair per ISO
+ * week (weekKey like "2026-W40"). Generated top-down (monthly → H1) while
+ * the market is closed; served read-only all week.
+ */
+model WeeklyOutlook {
+  id          Int              @id @default(autoincrement())
+  weekKey     String
+  pairCode    String
+  bias        WeeklyBias
+  confidence  Int
+  headline    String
+  narrative   String
+  supports    Json
+  resistances Json
+  scenarios   Json
+  catalysts   Json
+  tradingPlan String
+  engine      PredictionEngine @default(RULE_BASED)
+  modelName   String?
+  weekStart   DateTime
+  weekEnd     DateTime
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([weekKey, pairCode])
+  @@index([weekKey])
+}
+
+/**
+ * A user's own record of acting on a signal ("I took this trade"). Prices are
+ * optional: a trade can be logged before it is closed. Results are computed
+ * from entry/exit and the side, never stored.
+ */
+model UserTrade {
+  id           Int        @id @default(autoincrement())
+  userId       Int
+  predictionId Int
+  side         Direction
+  entryPrice   Decimal?   @db.Decimal(16, 6)
+  exitPrice    Decimal?   @db.Decimal(16, 6)
+  lots         Decimal?   @db.Decimal(10, 2)
+  notes        String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prediction   Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, predictionId])
+  @@index([userId, createdAt])
+}
