@@ -63,6 +63,8 @@ export interface Prediction {
   outcome: PredictionOutcome | null;
   /** Only on currently active signals in the dashboard. */
   live?: LiveProgress | null;
+  /** "Hold" call: id of the still-open earlier signal this window manages. */
+  continuesId: string | null;
 }
 
 export interface MarketEvent {
@@ -122,6 +124,8 @@ export interface DashboardData {
   killzoneLabel: string | null;
   playbookHint: string | null;
   predictions: Prediction[];
+  /** Earlier signals that triggered and are still running past their window. */
+  openTrades: Prediction[];
   history: Prediction[];
   events: MarketEvent[];
   prices: TickerPrice[];
@@ -174,6 +178,7 @@ export function createEmptyDashboard(date = new Date()): DashboardData {
     killzoneLabel: null,
     playbookHint: null,
     predictions: [],
+    openTrades: [],
     history: [],
     events: [],
     prices: [],

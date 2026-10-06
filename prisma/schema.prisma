@@ -84,6 +84,9 @@ model Prediction {
   targetPips        Decimal?           @db.Decimal(12, 2)
   riskReward        Decimal?           @db.Decimal(8, 2)
   atrPips           Decimal?           @db.Decimal(12, 2)
+  /// Set on a "hold" call: the still-open earlier signal this window manages
+  /// instead of publishing a duplicate entry.
+  continuesId       Int?
   validFrom         DateTime
   expiresAt         DateTime
   createdAt         DateTime           @default(now())

@@ -21,6 +21,12 @@ const pairs = [
 export async function bootstrapDatabase() {
   await prisma.$connect();
 
+  // Additive, idempotent column migrations, so a deploy that runs before
+  // `prisma db push` cannot take the API down with "column does not exist".
+  await prisma.$executeRawUnsafe(
+    'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "continuesId" INTEGER'
+  );
+
   // Static reference data only — no market content is seeded. Predictions,
   // outcomes and calendar events are produced exclusively by the live
   // providers (Twelve Data, Trading Economics, DeepSeek) when configured.

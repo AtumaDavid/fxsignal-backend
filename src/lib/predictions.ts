@@ -133,6 +133,7 @@ export function fromRow(row: DbPrediction): Prediction {
     targetPips: row.targetPips === null ? null : Number(row.targetPips),
     riskReward: row.riskReward === null ? null : Number(row.riskReward),
     atrPips: row.atrPips === null ? null : Number(row.atrPips),
+    continuesId: row.continuesId === null ? null : String(row.continuesId),
     validFrom: row.validFrom.toISOString(),
     expiresAt: row.expiresAt.toISOString(),
     createdAt: row.createdAt.toISOString(),
@@ -496,6 +497,7 @@ function toPrediction(
   ai = aiUsable;
   return {
     id: '',
+    continuesId: null,
     pairCode: signal.pairCode,
     windowKey: windowKeyFor(now),
     direction,
@@ -556,6 +558,9 @@ async function insertPrediction(prediction: Prediction) {
       targetPips: prediction.targetPips,
       riskReward: prediction.riskReward,
       atrPips: prediction.atrPips,
+      continuesId: prediction.continuesId
+        ? Number(prediction.continuesId)
+        : null,
       validFrom: prediction.validFrom,
       expiresAt: prediction.expiresAt,
       outcome: {
@@ -593,6 +598,9 @@ async function updatePredictionWithSignal(id: number, prediction: Prediction) {
       targetPips: prediction.targetPips,
       riskReward: prediction.riskReward,
       atrPips: prediction.atrPips,
+      continuesId: prediction.continuesId
+        ? Number(prediction.continuesId)
+        : null,
       outcome: {
         upsert: {
           create: {
@@ -792,14 +800,17 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
  * published. Read-only: never calls the provider (maintenance keeps the M15
  * series fresh while a signal is open).
  */
-async function liveProgress(p: Prediction): Promise<LiveProgress | null> {
+async function liveProgress(
+  p: Prediction,
+  until: Date = new Date(p.expiresAt)
+): Promise<LiveProgress | null> {
   const cached = await peekStale<Candle[]>(
     `twelvedata:tf:${p.pairCode}:M15`
   ).catch(() => null);
   if (!cached || cached.length === 0) return null;
   const span = 15 * 60_000;
   const from = new Date(p.validFrom).getTime();
-  const to = new Date(p.expiresAt).getTime();
+  const to = until.getTime();
   const candles = [...cached]
     .sort((a, b) => candleTime(a) - candleTime(b))
     .filter((c) => candleTime(c) + span > from && candleTime(c) < to);
@@ -898,13 +909,35 @@ function windowCandles(
 const SETTLEMENT_GRACE_MS = 3 * 60 * 60_000;
 
 /**
- * Settles expired signals from the M15 (or H1) price path of their window.
- * Signals whose window the price feed cannot cover — for example ones that
- * expired while the server was offline for longer than the H1 history — are
- * closed as unverifiable instead of being judged against a later price.
+ * A triggered trade is followed past its window until it reaches its target
+ * or stop. Day trades are not carried over the weekend gap, so anything still
+ * open at the Friday close of its week is closed there at the last price.
  */
-export async function evaluateExpiredPredictions(now = new Date()) {
-  if (!liveDataEnabled()) return;
+export function tradeHoldUntil(validFrom: Date): Date {
+  return nextMarketClose(validFrom);
+}
+
+const OPEN_TRADE_NOTE =
+  'Triggered in its window and still open — tracked until target, stop or the Friday close.';
+
+/**
+ * Settles expired signals from their price path, in two phases:
+ * 1. The window: no fill in the entry zone means no trade (EXPIRED, not
+ *    scored); a target or stop inside the window settles it.
+ * 2. After the window: a trade that filled and is still running stays open
+ *    (PENDING, with its running pips) until target or stop trades, or the
+ *    Friday close, where it is marked to the last price.
+ * Windows the candle history can no longer cover are closed as unscored
+ * instead of being judged against a later price.
+ *
+ * Returns the pairs that still have open trades, so maintenance can keep
+ * their candles fresh.
+ */
+export async function evaluateExpiredPredictions(
+  now = new Date()
+): Promise<Set<PairCode>> {
+  const openPairs = new Set<PairCode>();
+  if (!liveDataEnabled()) return openPairs;
 
   const pending = await prisma.prediction.findMany({
     where: {
@@ -913,80 +946,270 @@ export async function evaluateExpiredPredictions(now = new Date()) {
     },
     include: { outcome: true },
   });
-  if (pending.length === 0) return;
+  if (pending.length === 0) return openPairs;
 
-  // One series per pair and timeframe for the whole batch (cached and
-  // credit-budgeted), never one request per row.
+  // One series per pair and timeframe for the whole batch. The cached copy is
+  // used when it already covers what is needed; the provider is only asked
+  // (through the cache + credit budget) when it does not. Open trades past
+  // their window ride on the throttled live refresh instead.
   const series = new Map<string, Candle[]>();
-  async function candlesFor(pair: PairCode, timeframe: Timeframe) {
+  async function candlesFor(
+    pair: PairCode,
+    timeframe: Timeframe,
+    needUntil: Date
+  ) {
     const key = `${pair}:${timeframe}`;
-    if (!series.has(key)) {
-      try {
-        series.set(key, await fetchTimeframeCandles(pair, timeframe));
-      } catch (error) {
-        console.warn(
-          `No ${timeframe} candles to settle ${pair}; its signals stay pending.`,
-          error instanceof Error ? error.message : error
-        );
-        series.set(key, []);
-      }
+    const known = series.get(key);
+    const span = CANDLE_MS[timeframe] ?? 60 * 60_000;
+    const covers = (candles: Candle[] | null | undefined) =>
+      Boolean(candles?.length) &&
+      Math.max(...candles!.map(candleTime)) + span >= needUntil.getTime();
+    if (covers(known)) return known!;
+    const cached = await peekStale<Candle[]>(
+      `twelvedata:tf:${pair}:${timeframe}`
+    ).catch(() => null);
+    if (covers(cached)) {
+      series.set(key, cached!);
+      return cached!;
     }
-    return series.get(key) ?? [];
+    try {
+      const fresh = await fetchTimeframeCandles(pair, timeframe);
+      series.set(key, fresh);
+      return fresh;
+    } catch (error) {
+      console.warn(
+        `No ${timeframe} candles to settle ${pair}; its signals stay pending.`,
+        error instanceof Error ? error.message : error
+      );
+      const fallback = cached ?? known ?? [];
+      series.set(key, fallback);
+      return fallback;
+    }
   }
 
-  for (const row of pending) {
-    const pair = row.pairCode as PairCode;
-    let path: Candle[] | null = null;
-    for (const timeframe of ['M15', 'H1'] as const) {
-      path = windowCandles(
-        await candlesFor(pair, timeframe),
-        timeframe,
-        row.validFrom,
-        row.expiresAt
-      );
-      if (path) break;
-    }
-
-    let result: Settlement;
-    if (path) {
-      result = settleFromCandles(
-        {
-          pairCode: row.pairCode,
-          direction: row.direction,
-          entryLow: Number(row.entryLow),
-          entryHigh: Number(row.entryHigh),
-          targetPrice: Number(row.targetPrice),
-          invalidationPrice: Number(row.invalidationPrice),
-        },
-        path
-      );
-    } else if (now.getTime() - row.expiresAt.getTime() > SETTLEMENT_GRACE_MS) {
-      result = {
-        status: 'EXPIRED',
-        resolvedPrice: null,
-        movementPips: null,
-        note: 'Not scored — no price data covering this window was available.',
-      };
-    } else {
-      continue; // The newest candles are not published yet; retry next pass.
-    }
-
+  const store = async (
+    rowId: number,
+    data: Settlement & { status: PrismaOutcomeStatus }
+  ) => {
     try {
       await prisma.predictionOutcome.update({
-        where: { predictionId: row.id },
+        where: { predictionId: rowId },
         data: {
-          ...result,
+          ...data,
           evaluatedAt: now,
           source: 'LIVE' as PrismaOutcomeSource,
         },
       });
     } catch (error) {
       console.warn(
-        `Unable to store the outcome for prediction ${row.id}.`,
+        `Unable to store the outcome for prediction ${rowId}.`,
         error instanceof Error ? error.message : error
       );
     }
+  };
+
+  for (const row of pending) {
+    const pair = row.pairCode as PairCode;
+    const levels: LevelRow = {
+      pairCode: row.pairCode,
+      direction: row.direction,
+      entryLow: Number(row.entryLow),
+      entryHigh: Number(row.entryHigh),
+      targetPrice: Number(row.targetPrice),
+      invalidationPrice: Number(row.invalidationPrice),
+    };
+
+    // A hold call manages an earlier open trade; it is never a trade itself.
+    if (row.continuesId !== null) {
+      await store(row.id, {
+        status: 'EXPIRED',
+        resolvedPrice: null,
+        movementPips: null,
+        note: 'Hold — managed an earlier open trade; not scored separately.',
+      });
+      continue;
+    }
+
+    // Phase 1: the signal's own window.
+    let windowPath: Candle[] | null = null;
+    let windowTf: Timeframe = 'M15';
+    for (const timeframe of ['M15', 'H1'] as const) {
+      windowPath = windowCandles(
+        await candlesFor(pair, timeframe, row.expiresAt),
+        timeframe,
+        row.validFrom,
+        row.expiresAt
+      );
+      if (windowPath) {
+        windowTf = timeframe;
+        break;
+      }
+    }
+    if (!windowPath) {
+      if (now.getTime() - row.expiresAt.getTime() > SETTLEMENT_GRACE_MS) {
+        await store(row.id, {
+          status: 'EXPIRED',
+          resolvedPrice: null,
+          movementPips: null,
+          note: 'Not scored — no price data covering this window was available.',
+        });
+      }
+      continue; // Otherwise the newest candles are not published yet.
+    }
+    const inWindow = replayPath(levels, windowPath);
+    if (inWindow.state !== 'running') {
+      await store(row.id, settleFromCandles(levels, windowPath));
+      continue;
+    }
+
+    // Phase 2: filled in its window and still open — follow it.
+    const holdUntil = tradeHoldUntil(row.validFrom);
+    const until = now < holdUntil ? now : holdUntil;
+    const span = CANDLE_MS[windowTf] ?? 60 * 60_000;
+    const all = (series.get(`${pair}:${windowTf}`) ?? [])
+      .slice()
+      .sort((x, y) => candleTime(x) - candleTime(y))
+      .filter(
+        (c) =>
+          candleTime(c) + span > row.validFrom.getTime() &&
+          candleTime(c) < until.getTime()
+      );
+    const path = replayPath(levels, all);
+    if (path.state === 'target' || path.state === 'stopped') {
+      const hit = path.state === 'target';
+      await store(row.id, {
+        status: hit ? 'HIT' : 'MISSED',
+        resolvedPrice: hit ? levels.targetPrice : levels.invalidationPrice,
+        movementPips: path.pips,
+        note: hit
+          ? 'Target reached after the window closed (the trade was followed until target or stop).'
+          : 'Invalidation traded after the window closed (the trade was followed until target or stop).',
+      });
+      continue;
+    }
+    const lastEnd = all.length ? candleTime(all[all.length - 1]) + span : 0;
+    if (now >= holdUntil && lastEnd >= holdUntil.getTime()) {
+      await store(row.id, {
+        status: 'EXPIRED',
+        resolvedPrice: path.lastClose,
+        movementPips: path.pips,
+        note: 'Still open at the Friday close — closed there and marked to the last price.',
+      });
+      continue;
+    }
+    // Still running: keep it open and record where it stands.
+    openPairs.add(pair);
+    await store(row.id, {
+      status: 'PENDING',
+      resolvedPrice: null,
+      movementPips: path.pips,
+      note: OPEN_TRADE_NOTE,
+    });
   }
+  return openPairs;
+}
+
+function utcClock(iso: string) {
+  return `${new Date(iso).toISOString().slice(11, 16)} UTC`;
+}
+
+/**
+ * How a new window's call relates to a trade on the same pair that is still
+ * running from an earlier window:
+ * - same direction → a "hold": no second entry (it would double the risk and
+ *   double-count one move); the card shows the open trade's levels and says
+ *   to manage it. Holds are not scored separately.
+ * - opposite direction → published as normal, with a warning to close or
+ *   reduce the open trade first.
+ * - neutral → published as normal, noting the open trade keeps its levels.
+ */
+export function withOpenTradeRules(
+  signal: Prediction,
+  open: Prediction[]
+): Prediction {
+  const prior = open.find((t) => t.pairCode === signal.pairCode);
+  if (!prior) return signal;
+  const side = prior.direction === 'LONG' ? 'long' : 'short';
+  const opened = utcClock(prior.validFrom);
+  const running =
+    prior.live?.pips !== null && prior.live?.pips !== undefined
+      ? ` (${prior.live.pips > 0 ? '+' : ''}${prior.live.pips}p)`
+      : '';
+
+  if (signal.direction === prior.direction) {
+    return {
+      ...signal,
+      direction: 'NEUTRAL',
+      continuesId: prior.id,
+      entryLow: prior.entryLow,
+      entryHigh: prior.entryHigh,
+      targetPrice: prior.targetPrice,
+      invalidationPrice: prior.invalidationPrice,
+      stopPips: prior.stopPips,
+      targetPips: prior.targetPips,
+      riskReward: prior.riskReward,
+      rationale:
+        `Hold. The ${opened} ${side} on ${signal.pairCode} is still open${running}, and this window's read points the same way, so there is no second entry. ${signal.rationale}`.slice(
+          0,
+          600
+        ),
+      factors: [`Managing the open ${opened} ${side}`, ...signal.factors].slice(
+        0,
+        5
+      ),
+      playbook: `Hold the ${opened} ${side}: keep the stop at ${prior.invalidationPrice} and the target at ${prior.targetPrice}. No new entry this window.`,
+    };
+  }
+  if (signal.direction !== 'NEUTRAL') {
+    return {
+      ...signal,
+      factors: [
+        `Conflicts with the open ${opened} ${side} — close or reduce it before taking this one`,
+        ...signal.factors,
+      ].slice(0, 5),
+      playbook:
+        `The ${opened} ${side} is still open and points the other way: close or reduce it first. ${signal.playbook ?? ''}`.slice(
+          0,
+          600
+        ),
+    };
+  }
+  return {
+    ...signal,
+    factors: [
+      `The open ${opened} ${side} keeps running on its own levels`,
+      ...signal.factors,
+    ].slice(0, 5),
+  };
+}
+
+/**
+ * Earlier signals that triggered in their window and are still running,
+ * with live progress from the cached M15 candles. Read-only.
+ */
+export async function getOpenTrades(now = new Date()): Promise<Prediction[]> {
+  const rows = await prisma.prediction.findMany({
+    where: {
+      expiresAt: { lte: now },
+      direction: { not: 'NEUTRAL' },
+      continuesId: null,
+      outcome: { is: { status: 'PENDING' } },
+    },
+    include: { outcome: true },
+    orderBy: { validFrom: 'desc' },
+    take: 10,
+  });
+  const trades: Prediction[] = [];
+  for (const row of rows) {
+    const p = fromRow(row);
+    const holdUntil = tradeHoldUntil(row.validFrom);
+    const live = await liveProgress(p, now < holdUntil ? now : holdUntil);
+    // Only trades that actually filled; unfilled windows are just awaiting settlement.
+    if (live && live.state !== 'waiting' && live.state !== 'neutral') {
+      trades.push({ ...p, live });
+    }
+  }
+  return trades;
 }
 
 /**
@@ -1054,6 +1277,9 @@ export async function getOrCreatePredictions(
   let signals: Prediction[] = [];
   try {
     signals = await liveIntradayPredictions(now);
+    // Don't stack a duplicate entry on a trade that is still running.
+    const open = await getOpenTrades(now).catch(() => [] as Prediction[]);
+    signals = signals.map((signal) => withOpenTradeRules(signal, open));
   } catch (error) {
     console.warn(
       'Intraday generation unavailable; keeping the stored signal.',
@@ -1503,11 +1729,11 @@ const LIVE_REFRESH_MS =
   Math.max(0, Number(process.env.LIVE_PROGRESS_REFRESH_MINUTES ?? 30)) * 60_000;
 let lastLiveRefresh = 0;
 
-async function refreshLiveCandles(active: Prediction[], now: Date) {
-  if (LIVE_REFRESH_MS === 0 || active.length === 0) return;
+async function refreshLiveCandles(pairsToTrack: Set<PairCode>, now: Date) {
+  if (LIVE_REFRESH_MS === 0 || pairsToTrack.size === 0) return;
   if (now.getTime() - lastLiveRefresh < LIVE_REFRESH_MS) return;
   lastLiveRefresh = now.getTime();
-  for (const pairCode of new Set(active.map((p) => p.pairCode))) {
+  for (const pairCode of pairsToTrack) {
     // Served from cache when it is still fresh (20-minute TTL), so this never
     // buys the same series twice.
     await fetchTimeframeCandles(pairCode, 'M15').catch((error) =>
@@ -1532,11 +1758,16 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
       );
     }
   }
-  await evaluateExpiredPredictions(now);
+  const openTradePairs = await evaluateExpiredPredictions(now);
   // Intraday signals only make sense while the market is tradeable.
   if (isForexOpen(now)) {
     const active = await getOrCreatePredictions(now, options);
-    await refreshLiveCandles(active, now);
+    // One throttled refresh covers both the current signals and any earlier
+    // trades still running past their window.
+    await refreshLiveCandles(
+      new Set([...active.map((p) => p.pairCode), ...openTradePairs]),
+      now
+    );
   }
   // The weekend outlook is maintained at all times so it is ready before the close.
   try {
@@ -1636,14 +1867,23 @@ export async function getDashboardFromDatabase(
     eventRows.length > 0 ||
     weeklyOutlook.length > 0;
 
+  const openTrades = await getOpenTrades(now).catch(() => [] as Prediction[]);
   const withLive = await Promise.all(
-    predictions.map(async (p) => ({ ...p, live: await liveProgress(p) }))
+    predictions.map(async (p) => {
+      // A hold shows the progress of the trade it is managing.
+      if (p.continuesId) {
+        const managed = openTrades.find((t) => t.id === p.continuesId);
+        return { ...p, live: managed?.live ?? null };
+      }
+      return { ...p, live: await liveProgress(p) };
+    })
   );
 
   return {
     ...empty,
     marketStatus: open ? 'OPEN' : 'CLOSED',
     predictions: withLive,
+    openTrades,
     history,
     events: eventRows.map(eventFromRow),
     prices,
