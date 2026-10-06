@@ -176,6 +176,8 @@ export interface Confluence {
     score: number;
   }[];
   notes: string[];
+  /** Intraday model only: H1 clearly agrees with the daily/H4 context. */
+  h1Aligned?: boolean;
 }
 
 /**
@@ -406,6 +408,7 @@ export function intradayConfluence(
       score: v.biasScore,
     })),
     notes,
+    h1Aligned: direction !== 'NEUTRAL' && agrees(h1),
   };
 }
 

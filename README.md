@@ -68,7 +68,8 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 
 ## How the engine works
 
-- **Market hours:** Sunday 22:00 → Friday 22:00 UTC. Windows open at 00, 06, 12 and 18 UTC; a signal never outlives its window or the Friday close.
+- **Market hours & windows:** spot FX trades Sunday 22:00 → Friday 22:00 UTC. Signals are published per session window: Asia 00–07 UTC (lighter: only fully aligned setups, 70%+), London 07–12, New York 12–17. Nothing new 17:00–24:00 UTC or at weekends.
+- **Early re-checks:** when a trade hits target or stop during London or New York, the pair is re-read at the next H1 close (after a stop, H1 must clearly agree with the context). Max 2 trades per pair per window, one re-check per H1 candle, none in the last 45 minutes of a window. Each re-check costs ~2 Twelve Data credits (H1 + M15; Daily/H4 cached) plus one DeepSeek call.
 - **Model:** Daily + H4 set the direction; H1 executes (it must not oppose the context, and its ATR and last 10 bars of structure place the zone and stop); M15 only adjusts confidence. Every signal is at least 2R from the zone midpoint, or it stands aside.
 - **Model review:** DeepSeek may keep or downgrade the direction, never flip it; its levels are pushed to 2R or replaced by the engine's.
 - **Settlement:** each signal is replayed on M15 candles (H1 fallback). No fill in its window means no trade. A filled trade is followed after its window, even when newer signals appear, until target or stop trades (stop first if both share a candle), or the Friday close, where it is marked to the last price. Neutral calls are never scored.

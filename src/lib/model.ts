@@ -1,3 +1,4 @@
+import { nextWindowStart } from './market.js';
 export type PairCode = 'EUR/USD' | 'USD/JPY';
 export type Direction = 'LONG' | 'SHORT' | 'NEUTRAL';
 export type Impact = 'LOW' | 'MEDIUM' | 'HIGH';
@@ -151,28 +152,16 @@ export function getSession(date: Date) {
   return 'Asia pre-open';
 }
 
-export function nextSixHourWindow(date: Date) {
-  const next = new Date(date);
-  next.setUTCMinutes(0, 0, 0);
-  next.setUTCHours(Math.ceil(next.getUTCHours() / 6) * 6);
-  if (next <= date) next.setUTCHours(next.getUTCHours() + 6);
-  return next;
-}
-
-export function windowKeyFor(date: Date) {
-  return String(Math.floor(date.getTime() / (6 * 60 * 60 * 1000)));
-}
-
 /**
  * A dashboard shape with no content. Returned when the live market providers
  * are disabled or returned nothing, so the UI can render honest empty states
  * instead of simulated data.
  */
 export function createEmptyDashboard(date = new Date()): DashboardData {
-  const nextRefresh = nextSixHourWindow(date);
+  const nextRefresh = nextWindowStart(date);
   return {
     generatedAt: date.toISOString(),
-    cadence: 'Every 6 hours',
+    cadence: 'Asia, London and New York windows',
     marketStatus: 'OPEN',
     currentSession: getSession(date),
     killzoneLabel: null,

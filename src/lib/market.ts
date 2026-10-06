@@ -188,3 +188,98 @@ export function toPips(pair: PairCode, priceDistance: number): number {
 export function roundToPip(pair: PairCode, value: number): number {
   return Number(value.toFixed(decimals(pair)));
 }
+
+// ---- Signal windows (session-aligned) ---------------------------------------
+//
+// Signals are published at the session opens rather than on a fixed 6-hour
+// clock. London and New York carry the edge; Asia is a lighter read (only
+// fully aligned setups). Nothing new is published 17:00–24:00 UTC, when
+// liquidity thins out; trades already open are still followed to target or
+// stop.
+
+export type WindowId = 'ASIA' | 'LONDON' | 'NEW_YORK';
+
+export interface TradingWindow {
+  id: WindowId;
+  /** Label stored on signals (also the session filter value). */
+  label: 'Asia' | 'London' | 'New York';
+  start: Date;
+  end: Date;
+  /** Unique per day + window, e.g. "2026-10-06-LONDON". */
+  key: string;
+  /** Re-checks after a target or stop are allowed in this window. */
+  rearm: boolean;
+  /** Lighter read: publish only fully aligned setups. */
+  strict: boolean;
+}
+
+export const WINDOW_SCHEDULE: {
+  id: WindowId;
+  label: TradingWindow['label'];
+  startHour: number;
+  endHour: number;
+  rearm: boolean;
+  strict: boolean;
+}[] = [
+  {
+    id: 'ASIA',
+    label: 'Asia',
+    startHour: 0,
+    endHour: 7,
+    rearm: false,
+    strict: true,
+  },
+  {
+    id: 'LONDON',
+    label: 'London',
+    startHour: 7,
+    endHour: 12,
+    rearm: true,
+    strict: false,
+  },
+  {
+    id: 'NEW_YORK',
+    label: 'New York',
+    startHour: 12,
+    endHour: 17,
+    rearm: true,
+    strict: false,
+  },
+];
+
+/** The signal window `date` falls in, or null (17:00–24:00 UTC, or market closed). */
+export function tradingWindowAt(date = new Date()): TradingWindow | null {
+  if (!isForexOpen(date)) return null;
+  const hour = date.getUTCHours() + date.getUTCMinutes() / 60;
+  const slot = WINDOW_SCHEDULE.find(
+    (w) => hour >= w.startHour && hour < w.endHour
+  );
+  if (!slot) return null;
+  const day = new Date(
+    Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
+  );
+  const start = new Date(day.getTime() + slot.startHour * 3_600_000);
+  const end = new Date(day.getTime() + slot.endHour * 3_600_000);
+  return {
+    id: slot.id,
+    label: slot.label,
+    start,
+    end,
+    key: `${day.toISOString().slice(0, 10)}-${slot.id}`,
+    rearm: slot.rearm,
+    strict: slot.strict,
+  };
+}
+
+/** Start of the next signal window after `date` (skips evenings and weekends). */
+export function nextWindowStart(date = new Date()): Date {
+  const probe = new Date(date);
+  probe.setUTCMinutes(0, 0, 0);
+  for (let i = 0; i < 24 * 4; i += 1) {
+    probe.setUTCHours(probe.getUTCHours() + 1);
+    const w = tradingWindowAt(probe);
+    if (w && w.start.getTime() === probe.getTime() && probe > date)
+      return new Date(probe);
+  }
+  return nextMarketOpen(date);
+}

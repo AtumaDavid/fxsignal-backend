@@ -9,9 +9,6 @@ import {
 import { prisma } from './prisma.js';
 import {
   createEmptyDashboard,
-  getSession,
-  nextSixHourWindow,
-  windowKeyFor,
   type DashboardData,
   type Direction,
   type LiveProgress,
@@ -33,6 +30,9 @@ import {
   sessionInfo,
   toPips,
   tradingWeekAnchor,
+  tradingWindowAt,
+  nextWindowStart,
+  type TradingWindow,
   weekBounds,
   weekKeyFor,
 } from './market.js';
@@ -256,6 +256,11 @@ interface DeterministicSignal {
   };
 }
 
+/** Asia window: minimum confidence for a published trade. */
+const STRICT_MIN_CONFIDENCE = 70;
+/** Most trades per pair per window (the first call plus one re-check). */
+export const MAX_SIGNALS_PER_WINDOW = 2;
+
 /** Engine version recorded on rule-built signals. */
 const ENGINE_MODEL = 'ctx-h1-exec-v3';
 
@@ -264,8 +269,12 @@ export const INTRADAY_TIMEFRAMES: Timeframe[] = ['DAILY', 'H4', 'H1', 'M15'];
 /** H1 bars that define the execution structure (stop placement). */
 const H1_STRUCTURE_BARS = 10;
 
-function catalystPenalty(events: LiveMarketEvent[], now: Date): number {
-  const windowEnd = now.getTime() + 6 * 60 * 60 * 1000;
+function catalystPenalty(
+  events: LiveMarketEvent[],
+  now: Date,
+  until: Date = new Date(now.getTime() + 5 * 3_600_000)
+): number {
+  const windowEnd = until.getTime();
   let penalty = 0;
   for (const event of events) {
     const t = event.eventDate.getTime();
@@ -282,7 +291,15 @@ export function buildDeterministicSignal(
   events: LiveMarketEvent[],
   session: string,
   killzoneHint: string,
-  now: Date
+  now: Date,
+  options: {
+    /** Window end, for the catalyst look-ahead. */
+    windowEnd?: Date;
+    /** Lighter window (Asia): publish only fully aligned, high-confidence setups. */
+    strict?: boolean;
+    /** Re-check after a stop: H1 must positively agree with the context. */
+    requireH1Aligned?: boolean;
+  } = {}
 ): DeterministicSignal | null {
   const views: TimeframeView[] = [];
   for (const tf of INTRADAY_TIMEFRAMES) {
@@ -297,9 +314,25 @@ export function buildDeterministicSignal(
   );
   if (!h1 || !hasContext) return null;
 
-  const penalty = catalystPenalty(events, now);
+  const penalty = catalystPenalty(events, now, options.windowEnd);
   const conf = intradayConfluence(views, penalty);
   if (!conf) return null;
+  if (conf.direction !== 'NEUTRAL') {
+    if (
+      options.strict &&
+      (conf.confidence < STRICT_MIN_CONFIDENCE || !conf.h1Aligned)
+    ) {
+      conf.notes.unshift(
+        `${session} is a lighter window: only fully aligned setups (${STRICT_MIN_CONFIDENCE}%+ confidence, H1 aligned) are published.`
+      );
+      conf.direction = 'NEUTRAL';
+    } else if (options.requireH1Aligned && !conf.h1Aligned) {
+      conf.notes.unshift(
+        'After a stop, H1 must clearly agree with the context again before a new entry.'
+      );
+      conf.direction = 'NEUTRAL';
+    }
+  }
 
   // Price from the confirmation timeframe (freshest), levels from H1.
   const price = views.find((v) => v.timeframe === 'M15')?.price ?? h1.price;
@@ -404,15 +437,11 @@ export function buildDeterministicSignal(
 }
 
 /**
- * A signal covers the rest of its six-hour window (00/06/12/18 UTC) and never
- * outlives the Friday close. Expiring one window later used to leave each
- * signal active for up to 12 hours, so the next window never generated its
- * own signal and the advertised 6-hour cadence silently became 12.
+ * A signal covers the rest of its session window (Asia 00–07, London 07–12,
+ * New York 12–17 UTC). Outside the windows nothing new is published.
  */
 export function signalWindowEnd(now: Date): Date {
-  const windowEnd = nextSixHourWindow(now);
-  const close = nextMarketClose(now);
-  return windowEnd < close ? windowEnd : close;
+  return tradingWindowAt(now)?.end ?? now;
 }
 
 /**
@@ -499,7 +528,7 @@ function toPrediction(
     id: '',
     continuesId: null,
     pairCode: signal.pairCode,
-    windowKey: windowKeyFor(now),
+    windowKey: tradingWindowAt(now)?.key ?? now.toISOString().slice(0, 13),
     direction,
     // Labelled by what actually shaped the published call.
     engine: aiUsable ? engine : 'RULE_BASED',
@@ -513,7 +542,7 @@ function toPrediction(
     invalidationPrice,
     rationale: (ai?.rationale ?? signal.rationale).slice(0, 600),
     factors: (ai?.factors?.length ? ai.factors : signal.factors).slice(0, 5),
-    session: getSession(now),
+    session: tradingWindowAt(now)?.label ?? 'Off hours',
     playbook: (ai?.playbook ?? signal.playbook).slice(0, 600),
     timeframeBias: signal.votes,
     stopPips: risk.stopPips,
@@ -575,56 +604,21 @@ async function insertPrediction(prediction: Prediction) {
   });
 }
 
-async function updatePredictionWithSignal(id: number, prediction: Prediction) {
-  return prisma.prediction.update({
-    where: { id },
-    data: {
-      direction: prediction.direction as PrismaDirection,
-      engine: prediction.engine as PrismaPredictionEngine,
-      modelName: prediction.modelName,
-      confidence: prediction.confidence,
-      entryLow: prediction.entryLow,
-      entryHigh: prediction.entryHigh,
-      targetPrice: prediction.targetPrice,
-      invalidationPrice: prediction.invalidationPrice,
-      rationale: prediction.rationale,
-      factors: prediction.factors,
-      session: prediction.session,
-      playbook: prediction.playbook,
-      timeframeBias:
-        (prediction.timeframeBias as unknown as Prisma.InputJsonValue) ??
-        Prisma.JsonNull,
-      stopPips: prediction.stopPips,
-      targetPips: prediction.targetPips,
-      riskReward: prediction.riskReward,
-      atrPips: prediction.atrPips,
-      continuesId: prediction.continuesId
-        ? Number(prediction.continuesId)
-        : null,
-      outcome: {
-        upsert: {
-          create: {
-            source: 'LIVE' as PrismaOutcomeSource,
-            status: 'PENDING' as PrismaOutcomeStatus,
-            note: 'Waiting for a live price evaluation.',
-          },
-          update: {
-            source: 'LIVE' as PrismaOutcomeSource,
-            status: 'PENDING' as PrismaOutcomeStatus,
-            note: 'Waiting for a live price evaluation.',
-          },
-        },
-      },
-    },
-    include: { outcome: true },
-  });
-}
-
 /**
  * Builds the current-window signals from multi-timeframe market data.
  * Deterministic indicators always run; DeepSeek refines when configured.
  */
-async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
+interface GenerationTarget {
+  pair: PairCode;
+  /** Set when this is an early re-check after the pair's trade closed. */
+  rearmAfter?: 'target' | 'stopped';
+}
+
+async function liveIntradayPredictions(
+  now: Date,
+  window: TradingWindow,
+  targets: GenerationTarget[]
+): Promise<Prediction[]> {
   const info = sessionInfo(now);
   const events = await fetchLiveEvents(now).catch((error) => {
     console.warn(
@@ -640,7 +634,7 @@ async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
     signal: DeterministicSignal;
     mtfContext: MtfPairContext;
   }[] = [];
-  for (const pair of pairs) {
+  for (const { pair, rearmAfter } of targets) {
     try {
       // Only the four intraday timeframes: monthly/weekly are not needed here
       // (and skipping them saves provider credits).
@@ -649,9 +643,14 @@ async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
         pair,
         mtf,
         events,
-        info.session,
+        window.label,
         info.playbookHint,
-        now
+        now,
+        {
+          windowEnd: window.end,
+          strict: window.strict,
+          requireH1Aligned: rearmAfter === 'stopped',
+        }
       );
       if (!signal) {
         console.warn(`Insufficient MTF context for ${pair}; skipping.`);
@@ -664,7 +663,7 @@ async function liveIntradayPredictions(now: Date): Promise<Prediction[]> {
           pairCode: pair,
           price: signal.price,
           confluence: signal.confluence,
-          session: info.session,
+          session: window.label,
           killzoneHint: info.playbookHint,
         },
       });
@@ -1233,86 +1232,158 @@ export async function getCurrentPredictions(
   );
 }
 
+/** Re-checks are attempted at most once per pair per H1 candle. */
+const lastRearmCheck = new Map<PairCode, string>();
+/** Leave at least this long in the window for a re-check trade to work. */
+const REARM_MIN_TIME_LEFT_MS = 45 * 60_000;
+
+/** The first H1 close after a trade closed inside the M15 candle at `closedAt`. */
+function nextH1Close(closedAt: string): Date {
+  const t = new Date(new Date(closedAt).getTime() + 15 * 60_000);
+  const close = new Date(t);
+  close.setUTCMinutes(0, 0, 0);
+  if (close < t) close.setUTCHours(close.getUTCHours() + 1);
+  return close;
+}
+
 /**
- * Creates or refreshes the current-window signals from multi-timeframe
- * analysis. No-ops while the market is closed (weekends) — there is no
- * intraday edge to publish, and the weekend outlook owns that window.
+ * Creates the signals for the current session window and, during London
+ * and New York, re-checks a pair early when its trade has already reached
+ * target or stop:
+ * - at the first H1 close after it closed (H1 is the execution timeframe);
+ * - after a stop, H1 must clearly agree with the context again;
+ * - at most MAX_SIGNALS_PER_WINDOW trades per pair per window, at most one
+ *   re-check per H1 candle, and not in the last 45 minutes of the window.
+ * Nothing is generated outside the windows (17:00–24:00 UTC, weekends).
  *
- * Free-tier friendly:
- * - once an active signal exists for the window, it is reused from the
- *   database and the providers are not called again until that signal expires;
- * - failed attempts back off for 15 minutes instead of hammering the providers.
- *   `force: true` (used by an explicit user retry) bypasses that cooldown.
+ * Free-tier friendly: stored signals are reused until they expire; failed
+ * first-generation attempts back off for 15 minutes (`force` bypasses it).
  */
 export async function getOrCreatePredictions(
   now = new Date(),
   options?: { force?: boolean }
 ): Promise<Prediction[]> {
   if (!liveDataEnabled()) return [];
-  if (!isForexOpen(now)) return getCurrentPredictions(now);
+  const window = tradingWindowAt(now);
+  if (!window) return getCurrentPredictions(now);
 
   const activeRows = await Promise.all(
     pairs.map((pair) => activePrediction(pair, now))
   );
-  const needsRefresh = activeRows.some((row) => !row);
+  const targets: GenerationTarget[] = [];
+  const closedRows = new Map<PairCode, DbPrediction>();
 
-  if (!needsRefresh) {
-    return activeRows
-      .filter((row): row is NonNullable<typeof row> => row !== null)
-      .map(fromRow);
+  for (const [index, pair] of pairs.entries()) {
+    const active = activeRows[index];
+    if (!active) {
+      targets.push({ pair });
+      continue;
+    }
+    // Early re-check: only for a real trade that has already closed.
+    if (
+      !window.rearm ||
+      active.direction === 'NEUTRAL' ||
+      active.continuesId !== null
+    )
+      continue;
+    const live = await liveProgress(fromRow(active));
+    if (
+      !live ||
+      (live.state !== 'target' && live.state !== 'stopped') ||
+      !live.closedAt
+    )
+      continue;
+    const checkAt = nextH1Close(live.closedAt);
+    if (
+      now < checkAt ||
+      window.end.getTime() - now.getTime() < REARM_MIN_TIME_LEFT_MS
+    )
+      continue;
+    const hourKey = now.toISOString().slice(0, 13);
+    if (lastRearmCheck.get(pair) === hourKey) continue;
+    const used = await prisma.prediction.count({
+      where: { pairCode: pair, windowKey: { startsWith: window.key } },
+    });
+    if (used >= MAX_SIGNALS_PER_WINDOW) continue;
+    lastRearmCheck.set(pair, hourKey);
+    targets.push({ pair, rearmAfter: live.state });
+    closedRows.set(pair, active);
   }
 
-  const nowMs = now.getTime();
-  if (
-    !options?.force &&
-    nowMs - lastAiGenerationAttempt < AI_GENERATION_COOLDOWN_MS
-  ) {
-    // Still cooling down from the last attempt; keep whatever is stored.
-    return activeRows
-      .filter((row): row is NonNullable<typeof row> => row !== null)
-      .map(fromRow);
+  if (targets.length === 0) return getCurrentPredictions(now);
+
+  // First-generation attempts share the failure cooldown; re-checks are
+  // already limited to one per H1 candle.
+  const firstGen = targets.filter((t) => !t.rearmAfter);
+  if (firstGen.length > 0 && !options?.force) {
+    if (now.getTime() - lastAiGenerationAttempt < AI_GENERATION_COOLDOWN_MS) {
+      const rearms = targets.filter((t) => t.rearmAfter);
+      targets.splice(0, targets.length, ...rearms);
+    } else {
+      lastAiGenerationAttempt = now.getTime();
+    }
   }
-  lastAiGenerationAttempt = nowMs;
+  if (targets.length === 0) return getCurrentPredictions(now);
 
   let signals: Prediction[] = [];
   try {
-    signals = await liveIntradayPredictions(now);
+    signals = await liveIntradayPredictions(now, window, targets);
     // Don't stack a duplicate entry on a trade that is still running.
     const open = await getOpenTrades(now).catch(() => [] as Prediction[]);
     signals = signals.map((signal) => withOpenTradeRules(signal, open));
   } catch (error) {
     console.warn(
-      'Intraday generation unavailable; keeping the stored signal.',
+      'Intraday generation unavailable; keeping the stored signals.',
       error instanceof Error ? error.message : error
     );
-    return activeRows
-      .filter((row): row is NonNullable<typeof row> => row !== null)
-      .map(fromRow);
+    return getCurrentPredictions(now);
   }
 
-  const result: Prediction[] = [];
-  for (const [index, pair] of pairs.entries()) {
-    const active = activeRows[index];
-    const signal = signals.find((s) => s.pairCode === pair);
-    if (!signal) {
-      if (active) result.push(fromRow(active));
-      continue;
-    }
+  for (const target of targets) {
+    const signal = signals.find((s) => s.pairCode === target.pair);
+    if (!signal) continue;
     try {
-      const row = active
-        ? await updatePredictionWithSignal(active.id, signal)
-        : await insertPrediction(signal);
-      result.push(fromRow(row as DbPrediction));
+      if (target.rearmAfter) {
+        // A re-check only publishes a new trade; a stand-aside keeps the
+        // closed trade on screen until the window ends.
+        if (signal.direction === 'NEUTRAL') {
+          console.info(
+            `Re-check for ${target.pair}: no new setup this candle.`
+          );
+          continue;
+        }
+        const used = await prisma.prediction.count({
+          where: {
+            pairCode: target.pair,
+            windowKey: { startsWith: window.key },
+          },
+        });
+        if (used >= MAX_SIGNALS_PER_WINDOW) continue;
+        const closed = closedRows.get(target.pair);
+        // The closed trade is finished: end it now so it settles and moves
+        // to history, and the new call becomes the active one.
+        if (closed) {
+          await prisma.prediction.update({
+            where: { id: closed.id },
+            data: { expiresAt: now },
+          });
+        }
+        await insertPrediction({
+          ...signal,
+          windowKey: `${window.key}-${used + 1}`,
+        });
+      } else {
+        await insertPrediction(signal);
+      }
     } catch (error) {
-      // Window race (unique pairCode+windowKey) — fall back to the stored row.
+      // Window race (unique pairCode + windowKey): keep what is stored.
       console.warn(
-        `Unable to store signal for ${pair}.`,
+        `Unable to store signal for ${target.pair}.`,
         error instanceof Error ? error.message : error
       );
-      if (active) result.push(fromRow(active));
     }
   }
-  return result;
+  return getCurrentPredictions(now);
 }
 
 export async function getHistory(
@@ -1899,7 +1970,7 @@ export async function getDashboardFromDatabase(
           : Math.round(average._avg.confidence),
       hitRate: resolved > 0 ? Number(((hits / resolved) * 100).toFixed(1)) : 0,
       nextRefresh: open
-        ? signalWindowEnd(now).toISOString()
+        ? nextWindowStart(now).toISOString()
         : nextMarketOpen(now).toISOString(),
     },
     liveDataEnabled: liveEnabled,

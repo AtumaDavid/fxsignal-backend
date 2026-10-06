@@ -270,7 +270,7 @@ function compactMtfContext(
   return JSON.stringify({
     asOf: new Date().toISOString(),
     style:
-      'intraday: daily+H4 context, H1 execution, M15 confirmation, min 2R, 6-hour window',
+      'intraday: daily+H4 context, H1 execution, M15 confirmation, min 2R, one session window (London, New York or Asia)',
     pairs: pairs.map((p) => ({
       pairCode: p.pairCode,
       currentPrice: p.price,

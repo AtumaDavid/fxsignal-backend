@@ -15,7 +15,7 @@ export const PLANS = [
     blurb: 'Explore the engine on both tracked pairs.',
     features: [
       'Two liquid majors',
-      '6-hour intraday signals',
+      'Session signals: London, New York, Asia',
       'Weekend weekly outlook',
       '7-day history',
       'Personal trade journal',

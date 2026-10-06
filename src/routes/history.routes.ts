@@ -9,6 +9,7 @@ import type { PairCode } from '../lib/model.js';
 const router = Router();
 
 const SESSIONS = [
+  'Asia',
   'Tokyo',
   'London',
   'London / New York',
