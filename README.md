@@ -71,7 +71,8 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 - **Market hours:** Sunday 22:00 → Friday 22:00 UTC. Windows open at 00, 06, 12 and 18 UTC; a signal never outlives its window or the Friday close.
 - **Model:** Daily + H4 set the direction; H1 executes (it must not oppose the context, and its ATR and last 10 bars of structure place the zone and stop); M15 only adjusts confidence. Every signal is at least 2R from the zone midpoint, or it stands aside.
 - **Model review:** DeepSeek may keep or downgrade the direction, never flip it; its levels are pushed to 2R or replaced by the engine's.
-- **Settlement:** each expired signal is replayed on M15 candles: no fill in the zone means no trade; after the fill, the first of target or stop decides (stop first if both share a candle). Neutral calls are never scored.
+- **Settlement:** each signal is replayed on M15 candles (H1 fallback). No fill in its window means no trade. A filled trade is followed after its window, even when newer signals appear, until target or stop trades (stop first if both share a candle), or the Friday close, where it is marked to the last price. Neutral calls are never scored.
+- **Holds:** if a new window points the same way as a trade still open on that pair, it is published as a hold (`continuesId` → the open trade): no second entry, not scored separately. An opposite call carries a warning to close or reduce the open trade.
 - **Provider budget:** all provider calls go through a restart-safe cache with single-flight requests, failure back-off and a per-minute credit budget. Web requests read the database only.
 
 ---
