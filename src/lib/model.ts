@@ -2,7 +2,8 @@ import { nextWindowStart } from './market.js';
 export type PairCode = 'EUR/USD' | 'USD/JPY';
 export type Direction = 'LONG' | 'SHORT' | 'NEUTRAL';
 export type Impact = 'LOW' | 'MEDIUM' | 'HIGH';
-export type OutcomeStatus = 'PENDING' | 'HIT' | 'MISSED' | 'EXPIRED';
+export type OutcomeStatus =
+  'PENDING' | 'HIT' | 'MISSED' | 'EXPIRED' | 'CANCELLED' | 'CLOSED_EARLY';
 export type OutcomeSource = 'LIVE' | 'DEMO';
 export type PredictionEngine = 'RULE_BASED' | 'DEEPSEEK';
 

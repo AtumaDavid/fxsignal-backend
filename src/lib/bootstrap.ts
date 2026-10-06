@@ -23,9 +23,22 @@ export async function bootstrapDatabase() {
 
   // Additive, idempotent column migrations, so a deploy that runs before
   // `prisma db push` cannot take the API down with "column does not exist".
-  await prisma.$executeRawUnsafe(
-    'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "continuesId" INTEGER'
-  );
+  // Each statement is independent and tolerant: on a brand-new database the
+  // tables do not exist yet (db:init creates them), which is fine.
+  for (const sql of [
+    'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "continuesId" INTEGER',
+    `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CANCELLED'`,
+    `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CLOSED_EARLY'`,
+  ]) {
+    await prisma
+      .$executeRawUnsafe(sql)
+      .catch((error: unknown) =>
+        console.warn(
+          `Schema patch skipped (${sql.split(' ').slice(0, 3).join(' ')}…):`,
+          error instanceof Error ? error.message.split('\n')[0] : error
+        )
+      );
+  }
 
   // Static reference data only — no market content is seeded. Predictions,
   // outcomes and calendar events are produced exclusively by the live

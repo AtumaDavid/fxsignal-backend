@@ -12,6 +12,7 @@ import {
   type DashboardData,
   type Direction,
   type LiveProgress,
+  type OutcomeStatus,
   type MarketEvent,
   type PairCode,
   type Prediction,
@@ -86,7 +87,7 @@ type DbPrediction = Prisma.PredictionGetPayload<typeof predictionWithOutcome>;
 function outcomeFromRow(row: DbPrediction['outcome']): Prediction['outcome'] {
   if (!row) return null;
   return {
-    status: row.status as 'PENDING' | 'HIT' | 'MISSED' | 'EXPIRED',
+    status: row.status as OutcomeStatus,
     resolvedPrice:
       row.resolvedPrice === null ? null : Number(row.resolvedPrice),
     movementPips: row.movementPips === null ? null : Number(row.movementPips),
@@ -1182,6 +1183,195 @@ export function withOpenTradeRules(
   };
 }
 
+// ---- Trade management on H1 closes ------------------------------------------
+//
+// H1 is the execution timeframe, so each closed H1 candle is a checkpoint:
+// - before entry, a setup that breaks is cancelled (not scored), and the pair
+//   waits for a clearer sign (re-read at a later H1 close with H1 required to
+//   agree again);
+// - after entry, a trade is closed early only on two pieces of evidence on the
+//   same H1 close: price back through the far side of the entry zone AND H1 or
+//   H4 now pointing against the trade. One wobble is what the stop is for.
+
+export interface ManageDecision {
+  action: 'none' | 'cancel' | 'exit';
+  reason: string;
+}
+
+const AGAINST = 15;
+
+export function decideOnH1Close(input: {
+  direction: 'LONG' | 'SHORT';
+  state: 'waiting' | 'running';
+  entryLow: number;
+  entryHigh: number;
+  invalidationPrice: number;
+  h1Close: number;
+  h1Score: number;
+  h4Score: number | null;
+  contextScore: number;
+}): ManageDecision {
+  const long = input.direction === 'LONG';
+  const sign = long ? 1 : -1;
+  const side = long ? 'long' : 'short';
+  const against = long ? 'bearish' : 'bullish';
+  const h1Against = sign * input.h1Score <= -AGAINST;
+  const h4Against = input.h4Score !== null && sign * input.h4Score <= -AGAINST;
+  const contextAgainst = sign * input.contextScore <= -AGAINST;
+
+  if (input.state === 'waiting') {
+    const beyondStop = long
+      ? input.h1Close < input.invalidationPrice
+      : input.h1Close > input.invalidationPrice;
+    if (beyondStop)
+      return {
+        action: 'cancel',
+        reason: `Cancelled before entry: H1 closed ${long ? 'below' : 'above'} the invalidation level without the zone filling.`,
+      };
+    if (contextAgainst)
+      return {
+        action: 'cancel',
+        reason: `Cancelled before entry: the daily/H4 context turned ${against}.`,
+      };
+    if (h1Against)
+      return {
+        action: 'cancel',
+        reason: `Cancelled before entry: H1 turned ${against} against the context. Waiting for a clearer sign.`,
+      };
+    return { action: 'none', reason: '' };
+  }
+
+  const backThrough = long
+    ? input.h1Close < input.entryLow
+    : input.h1Close > input.entryHigh;
+  if (backThrough && (h1Against || h4Against)) {
+    const which =
+      h1Against && h4Against ? 'H1 and H4' : h1Against ? 'H1' : 'H4';
+    return {
+      action: 'exit',
+      reason: `Exit suggested: H1 closed back ${long ? 'below' : 'above'} the entry zone and ${which} turned ${against} against the ${side}.`,
+    };
+  }
+  return { action: 'none', reason: '' };
+}
+
+/** Last closed H1 candle processed per pair, so each candle is checked once. */
+const lastManagedH1 = new Map<PairCode, number>();
+const H1_MS = 60 * 60_000;
+/** Give the provider a moment to publish the candle that just closed. */
+const H1_PUBLISH_DELAY_MS = 2 * 60_000;
+
+/**
+ * Runs the H1-close checkpoint for every pending trade (current-window
+ * signals and earlier trades still running). About one H1 request per pair
+ * per hour, only while there is something to manage; no model calls.
+ */
+export async function manageOnH1Close(now = new Date()) {
+  if (!liveDataEnabled() || !isForexOpen(now)) return;
+  const rows = await prisma.prediction.findMany({
+    where: {
+      direction: { not: 'NEUTRAL' },
+      continuesId: null,
+      validFrom: { lte: now, gte: new Date(now.getTime() - 7 * 24 * H1_MS) },
+      outcome: { is: { status: 'PENDING' } },
+    },
+    include: { outcome: true },
+  });
+  if (rows.length === 0) return;
+
+  const hourStart = Math.floor(now.getTime() / H1_MS) * H1_MS;
+  const lastClosedStart = hourStart - H1_MS;
+  if (now.getTime() - hourStart < H1_PUBLISH_DELAY_MS) return;
+
+  for (const pair of new Set(rows.map((r) => r.pairCode as PairCode))) {
+    if ((lastManagedH1.get(pair) ?? 0) >= lastClosedStart) continue;
+    let h1: Candle[];
+    let h4: Candle[] = [];
+    let daily: Candle[] = [];
+    try {
+      h1 = await fetchTimeframeCandles(pair, 'H1', lastClosedStart);
+      h4 = await fetchTimeframeCandles(pair, 'H4').catch(() => []);
+      daily = await fetchTimeframeCandles(pair, 'DAILY').catch(() => []);
+    } catch (error) {
+      console.warn(
+        `H1 checkpoint skipped for ${pair}.`,
+        error instanceof Error ? error.message : error
+      );
+      continue;
+    }
+    // Only fully closed H1 candles (the provider also returns the live one).
+    const closed = h1
+      .filter((c) => candleTime(c) + H1_MS <= now.getTime())
+      .sort((a, b) => candleTime(a) - candleTime(b));
+    const last = closed[closed.length - 1];
+    if (!last || candleTime(last) < lastClosedStart) continue; // not published yet
+    lastManagedH1.set(pair, lastClosedStart);
+
+    // Same indicators the engine uses; analyzeTimeframe expects newest-first.
+    const h1View = analyzeTimeframe(pair, 'H1', [...closed].reverse());
+    const h4View = h4.length >= 5 ? analyzeTimeframe(pair, 'H4', h4) : null;
+    const dailyView =
+      daily.length >= 5 ? analyzeTimeframe(pair, 'DAILY', daily) : null;
+    if (!h1View) continue;
+    const context = intradayConfluence(
+      [dailyView, h4View, h1View].filter((v): v is TimeframeView => Boolean(v))
+    );
+    if (!context) continue;
+
+    for (const row of rows.filter((r) => r.pairCode === pair)) {
+      const p = fromRow(row);
+      const path = replayPath(
+        p,
+        closed.filter((c) => candleTime(c) + H1_MS > row.validFrom.getTime())
+      );
+      // Target/stop already traded: settlement records it, nothing to manage.
+      if (path.state !== 'waiting' && path.state !== 'running') continue;
+      // An unfilled signal whose window is over is just "no position".
+      if (path.state === 'waiting' && row.expiresAt <= now) continue;
+
+      const decision = decideOnH1Close({
+        direction: p.direction as 'LONG' | 'SHORT',
+        state: path.state,
+        entryLow: p.entryLow,
+        entryHigh: p.entryHigh,
+        invalidationPrice: p.invalidationPrice,
+        h1Close: last.close,
+        h1Score: h1View.biasScore,
+        h4Score: h4View?.biasScore ?? null,
+        contextScore: context.score,
+      });
+      if (decision.action === 'none') continue;
+
+      const mid = (p.entryLow + p.entryHigh) / 2;
+      const pips = Number(
+        (
+          (p.direction === 'LONG' ? last.close - mid : mid - last.close) /
+          pipSize(pair)
+        ).toFixed(1)
+      );
+      try {
+        await prisma.predictionOutcome.update({
+          where: { predictionId: row.id },
+          data: {
+            status: decision.action === 'cancel' ? 'CANCELLED' : 'CLOSED_EARLY',
+            resolvedPrice: last.close,
+            movementPips: decision.action === 'cancel' ? null : pips,
+            evaluatedAt: now,
+            source: 'LIVE' as PrismaOutcomeSource,
+            note: decision.reason,
+          },
+        });
+        console.info(`${pair} #${row.id}: ${decision.reason}`);
+      } catch (error) {
+        console.warn(
+          `Unable to record the H1 checkpoint for prediction ${row.id}.`,
+          error instanceof Error ? error.message : error
+        );
+      }
+    }
+  }
+}
+
 /**
  * Earlier signals that triggered in their window and are still running,
  * with live progress from the cached M15 candles. Read-only.
@@ -1232,6 +1422,27 @@ export async function getCurrentPredictions(
   );
 }
 
+/** Hard cap on calls per pair per window, cancelled ones included. */
+const MAX_CALLS_PER_WINDOW = 4;
+
+/**
+ * Room for another trade in this window: at most MAX_SIGNALS_PER_WINDOW
+ * trades (cancelled-before-entry calls don't count, they were never trades)
+ * and MAX_CALLS_PER_WINDOW calls overall.
+ */
+async function windowHasRoom(pair: PairCode, window: TradingWindow) {
+  const inWindow = { pairCode: pair, windowKey: { startsWith: window.key } };
+  const [calls, cancelled] = await Promise.all([
+    prisma.prediction.count({ where: inWindow }),
+    prisma.prediction.count({
+      where: { ...inWindow, outcome: { is: { status: 'CANCELLED' } } },
+    }),
+  ]);
+  return (
+    calls - cancelled < MAX_SIGNALS_PER_WINDOW && calls < MAX_CALLS_PER_WINDOW
+  );
+}
+
 /** Re-checks are attempted at most once per pair per H1 candle. */
 const lastRearmCheck = new Map<PairCode, string>();
 /** Leave at least this long in the window for a re-check trade to work. */
@@ -1279,21 +1490,35 @@ export async function getOrCreatePredictions(
       targets.push({ pair });
       continue;
     }
-    // Early re-check: only for a real trade that has already closed.
+    // Early re-check: only for a real trade that is already finished — by
+    // target or stop, or by the H1 checkpoint (cancelled / closed early).
     if (
       !window.rearm ||
       active.direction === 'NEUTRAL' ||
       active.continuesId !== null
     )
       continue;
-    const live = await liveProgress(fromRow(active));
+    const status = active.outcome?.status;
+    let checkAt: Date;
+    let after: GenerationTarget['rearmAfter'];
     if (
-      !live ||
-      (live.state !== 'target' && live.state !== 'stopped') ||
-      !live.closedAt
-    )
-      continue;
-    const checkAt = nextH1Close(live.closedAt);
+      (status === 'CANCELLED' || status === 'CLOSED_EARLY') &&
+      active.outcome?.evaluatedAt
+    ) {
+      // Wait for a clearer sign: at least the next H1 close, H1 aligned again.
+      checkAt = nextH1Close(active.outcome.evaluatedAt.toISOString());
+      after = 'stopped';
+    } else {
+      const live = await liveProgress(fromRow(active));
+      if (
+        !live ||
+        (live.state !== 'target' && live.state !== 'stopped') ||
+        !live.closedAt
+      )
+        continue;
+      checkAt = nextH1Close(live.closedAt);
+      after = live.state;
+    }
     if (
       now < checkAt ||
       window.end.getTime() - now.getTime() < REARM_MIN_TIME_LEFT_MS
@@ -1301,12 +1526,9 @@ export async function getOrCreatePredictions(
       continue;
     const hourKey = now.toISOString().slice(0, 13);
     if (lastRearmCheck.get(pair) === hourKey) continue;
-    const used = await prisma.prediction.count({
-      where: { pairCode: pair, windowKey: { startsWith: window.key } },
-    });
-    if (used >= MAX_SIGNALS_PER_WINDOW) continue;
+    if (!(await windowHasRoom(pair, window))) continue;
     lastRearmCheck.set(pair, hourKey);
-    targets.push({ pair, rearmAfter: live.state });
+    targets.push({ pair, rearmAfter: after });
     closedRows.set(pair, active);
   }
 
@@ -1352,13 +1574,14 @@ export async function getOrCreatePredictions(
           );
           continue;
         }
+        if (!(await windowHasRoom(target.pair, window))) continue;
+        // Keys count every call in the window (cancelled ones included).
         const used = await prisma.prediction.count({
           where: {
             pairCode: target.pair,
             windowKey: { startsWith: window.key },
           },
         });
-        if (used >= MAX_SIGNALS_PER_WINDOW) continue;
         const closed = closedRows.get(target.pair);
         // The closed trade is finished: end it now so it settles and moves
         // to history, and the new call becomes the active one.
@@ -1830,6 +2053,13 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
     }
   }
   const openTradePairs = await evaluateExpiredPredictions(now);
+  // H1-close checkpoint: cancel broken setups, suggest exits on strong evidence.
+  await manageOnH1Close(now).catch((error) =>
+    console.warn(
+      'H1 checkpoint failed.',
+      error instanceof Error ? error.message : error
+    )
+  );
   // Intraday signals only make sense while the market is tradeable.
   if (isForexOpen(now)) {
     const active = await getOrCreatePredictions(now, options);
@@ -1946,6 +2176,11 @@ export async function getDashboardFromDatabase(
         const managed = openTrades.find((t) => t.id === p.continuesId);
         return { ...p, live: managed?.live ?? null };
       }
+      if (
+        p.outcome?.status === 'CANCELLED' ||
+        p.outcome?.status === 'CLOSED_EARLY'
+      )
+        return { ...p, live: null };
       return { ...p, live: await liveProgress(p) };
     })
   );

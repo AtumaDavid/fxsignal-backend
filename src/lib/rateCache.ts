@@ -89,6 +89,11 @@ export interface CacheOptions<T> {
    * a stale value would be wrong (for example settling an expired signal).
    */
   serveStaleOnError?: boolean;
+  /**
+   * Treat a still-fresh value as stale anyway (e.g. it does not yet contain
+   * a candle that has just closed). Failure back-off still applies.
+   */
+  staleIf?: (value: T) => boolean;
 }
 
 /**
@@ -106,7 +111,12 @@ export async function cached<T>(
 
   const entry = map.get(key);
   const now = Date.now();
-  if (entry?.hasValue && now < entry.expiresAt) return hydrate(entry.value);
+  if (
+    entry?.hasValue &&
+    now < entry.expiresAt &&
+    !options.staleIf?.(hydrate(entry.value))
+  )
+    return hydrate(entry.value);
 
   const pending = inFlight.get(key);
   if (pending) return (await pending) as T;

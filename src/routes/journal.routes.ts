@@ -86,7 +86,9 @@ router.get(
     const sum = (values: number[]) =>
       Number(values.reduce((a, b) => a + b, 0).toFixed(1));
     const engineScored = trades.filter((t) =>
-      ['HIT', 'MISSED'].includes(t.prediction.outcome?.status ?? '')
+      ['HIT', 'MISSED', 'CLOSED_EARLY'].includes(
+        t.prediction.outcome?.status ?? ''
+      )
     );
     res.json({
       trades,

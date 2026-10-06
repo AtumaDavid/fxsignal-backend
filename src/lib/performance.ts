@@ -12,10 +12,18 @@ interface Bucket {
 }
 
 export interface PerformanceSummary {
-  totals: Bucket & { notTriggered: number; pending: number; neutral: number };
+  totals: Bucket & {
+    notTriggered: number;
+    pending: number;
+    neutral: number;
+    /** Exited before target/stop by the H1 checkpoint (in net pips, not in the hit rate). */
+    closedEarly: number;
+    /** Withdrawn before entry; never a trade. */
+    cancelled: number;
+  };
   byPair: Bucket[];
   bySession: Bucket[];
-  /** Cumulative net pips over scored signals, oldest first. */
+  /** Cumulative net pips over scored trades and early exits, oldest first. */
   curve: { at: string; pips: number; pairCode: PairCode }[];
 }
 
@@ -67,6 +75,8 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
   let notTriggered = 0;
   let pending = 0;
   let neutral = 0;
+  let closedEarly = 0;
+  let cancelled = 0;
   const scoredRows: Prediction[] = [];
 
   for (const row of rows) {
@@ -77,6 +87,8 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
       `session:${row.session}`,
     ];
     const isScored = status === 'HIT' || status === 'MISSED';
+    // Early exits are real P&L (net pips, curve) but not a target/stop result.
+    const isEarly = status === 'CLOSED_EARLY';
     for (const key of keys) {
       const entry = group(key);
       entry.bucket.signals += 1;
@@ -85,13 +97,16 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
         entry.bucket.scored += 1;
         if (status === 'HIT') entry.bucket.hits += 1;
         else entry.bucket.misses += 1;
-        entry.bucket.netPips += row.outcome?.movementPips ?? 0;
       }
+      if (isScored || isEarly)
+        entry.bucket.netPips += row.outcome?.movementPips ?? 0;
     }
-    if (isScored) scoredRows.push(row);
+    if (isScored || isEarly) scoredRows.push(row);
+    if (isEarly) closedEarly += 1;
+    else if (status === 'CANCELLED') cancelled += 1;
     else if (status === 'PENDING') pending += 1;
-    else if (row.direction === 'NEUTRAL') neutral += 1;
-    else notTriggered += 1;
+    else if (!isScored && row.direction === 'NEUTRAL') neutral += 1;
+    else if (!isScored) notTriggered += 1;
   }
 
   const pick = (prefix: string) =>
@@ -126,6 +141,8 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
       notTriggered,
       pending,
       neutral,
+      closedEarly,
+      cancelled,
     },
     byPair: pick('pair'),
     bySession: pick('session'),

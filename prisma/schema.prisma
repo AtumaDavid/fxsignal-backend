@@ -18,6 +18,10 @@ enum OutcomeStatus {
   HIT
   MISSED
   EXPIRED
+  /// Withdrawn before the entry zone traded (the setup broke on an H1 close).
+  CANCELLED
+  /// Exited before target or stop on strong H1 evidence against the trade.
+  CLOSED_EARLY
 }
 
 enum OutcomeSource {

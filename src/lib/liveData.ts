@@ -126,7 +126,9 @@ function parseCandles(values: TwelveSeriesResponse['values']): Candle[] {
 /** Newest-first candles for one pair + timeframe (as returned by the API). */
 export async function fetchTimeframeCandles(
   pairCode: PairCode,
-  timeframe: Timeframe
+  timeframe: Timeframe,
+  /** Refetch (cache permitting) if the series has no candle starting at or after this time. */
+  needCandleFrom?: number
 ): Promise<Candle[]> {
   const config = TF_CONFIG[timeframe];
   return cached(
@@ -147,7 +149,14 @@ export async function fetchTimeframeCandles(
         throw new Error(`No ${timeframe} series returned for ${pairCode}.`);
       return candles;
     },
-    { ttlMs: config.ttlMs, serveStaleOnError: true }
+    {
+      ttlMs: config.ttlMs,
+      serveStaleOnError: true,
+      staleIf:
+        needCandleFrom === undefined
+          ? undefined
+          : (candles) => !candles.some((c) => candleTime(c) >= needCandleFrom),
+    }
   );
 }
 
