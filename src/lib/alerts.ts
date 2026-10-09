@@ -208,7 +208,9 @@ async function deliverTo(
             keys: { p256dh: sub.p256dh, auth: sub.auth },
           },
           payload,
-          { TTL: 60 * 60 }
+          // Time-sensitive: without "high", phones in power-saving mode
+          // may hold the alert back until they wake up.
+          { TTL: 60 * 60, urgency: 'high' }
         )
         .catch(async (error: { statusCode?: number; message?: string }) => {
           // Gone / not found: the browser dropped the subscription.
