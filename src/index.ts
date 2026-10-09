@@ -21,6 +21,7 @@ import candlesRoutes from './routes/candles.routes.js';
 import publicRoutes from './routes/public.routes.js';
 import journalRoutes from './routes/journal.routes.js';
 import notificationsRoutes from './routes/notifications.routes.js';
+import recapRoutes from './routes/recap.routes.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 4004;
@@ -91,6 +92,7 @@ app.use('/api/outlook', requireAuth, outlookRoutes);
 app.use('/api/candles', requireAuth, candlesRoutes);
 app.use('/api/journal', requireAuth, journalRoutes);
 app.use('/api/notifications', requireAuth, notificationsRoutes);
+app.use('/api/recap', requireAuth, recapRoutes);
 // Unauthenticated, so it gets its own per-IP budget.
 app.use('/api/public', rateLimit(60, 60_000), publicRoutes);
 app.use('/api/billing', billingRoutes);
