@@ -2275,13 +2275,48 @@ export async function maintainMarketData(
     if (Date.now() - lastForcedRun < FORCED_RUN_COOLDOWN_MS) force = false;
     else lastForcedRun = Date.now();
   }
-  maintenanceRun = runMaintenance(now, { force }).finally(() => {
-    maintenanceRun = null;
-  });
+  const started = Date.now();
+  maintenanceRun = runMaintenance(now, { force })
+    .then(() => {
+      ops.maintenance = {
+        at: new Date().toISOString(),
+        ms: Date.now() - started,
+        ok: true,
+        error: null,
+      };
+    })
+    .catch((error: unknown) => {
+      ops.maintenance = {
+        at: new Date().toISOString(),
+        ms: Date.now() - started,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    })
+    .finally(() => {
+      maintenanceRun = null;
+    });
   return maintenanceRun;
 }
 
 let maintenanceRun: Promise<void> | null = null;
+
+/** Background job health, for the admin page. */
+const ops = {
+  startedAt: new Date().toISOString(),
+  maintenance: null as null | {
+    at: string;
+    ms: number;
+    ok: boolean;
+    error: string | null;
+  },
+  candleLoopAt: null as string | null,
+};
+
+export function getOpsStatus() {
+  return ops;
+}
 
 // ---- Candle-close loop ---------------------------------------------------------
 //
@@ -2305,6 +2340,7 @@ let candleLoopRun: Promise<void> | null = null;
 
 export function onCandleClose(now = new Date()) {
   if (candleLoopRun) return candleLoopRun;
+  ops.candleLoopAt = now.toISOString();
   candleLoopRun = (async () => {
     await manageOnH1Close(now).catch((error) =>
       console.warn(

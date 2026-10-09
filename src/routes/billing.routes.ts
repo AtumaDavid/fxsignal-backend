@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma.js';
+import { isAdminEmail } from '../lib/admin.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
 
@@ -73,6 +74,7 @@ router.get(
         plan: user.plan,
         planStatus: user.planStatus,
         createdAt: user.createdAt,
+        isAdmin: isAdminEmail(user.email),
       },
       plan,
       usage: {
@@ -116,6 +118,7 @@ router.post(
         plan: user.plan,
         planStatus: user.planStatus,
         createdAt: user.createdAt,
+        isAdmin: isAdminEmail(user.email),
       },
       plan: planFor(user.plan),
       checkout: 'simulated',

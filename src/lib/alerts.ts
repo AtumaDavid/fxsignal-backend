@@ -158,6 +158,26 @@ interface Delivery {
   test?: boolean;
 }
 
+/** Kept for the admin page; never throws. */
+async function recordFailure(
+  userId: number,
+  channel: 'email' | 'push',
+  kind: string,
+  error: unknown
+) {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'object' && error && 'message' in error
+        ? String((error as { message: unknown }).message)
+        : String(error);
+  await prisma.alertFailure
+    .create({
+      data: { userId, channel, kind, error: message.slice(0, 500) },
+    })
+    .catch(() => undefined);
+}
+
 async function deliverTo(
   user: { id: number; email: string; alertPrefs: Prisma.JsonValue | null },
   alert: Delivery
@@ -185,12 +205,13 @@ async function deliverTo(
         text: `${alert.body}\n\n${APP_URL}${alert.path}`,
         html: emailHtml(alert.title, alert.body, alert.path),
       })
-      .catch((error: unknown) =>
+      .catch((error: unknown) => {
         console.warn(
           `Alert email to user ${user.id} failed.`,
           error instanceof Error ? error.message : error
-        )
-      );
+        );
+        void recordFailure(user.id, 'email', alert.kind, error);
+      });
   }
 
   if (prefs.channels.push && pushConfigured()) {
@@ -225,6 +246,7 @@ async function deliverTo(
               `Push to user ${user.id} failed.`,
               error.message ?? error
             );
+            void recordFailure(user.id, 'push', alert.kind, error);
           }
         });
     }

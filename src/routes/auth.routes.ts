@@ -9,6 +9,7 @@ import {
 } from '../lib/auth.js';
 import { requireAuth } from '../middleware/auth.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
+import { isAdminEmail } from '../lib/admin.js';
 
 const router = Router();
 
@@ -51,6 +52,7 @@ function toPublicUser(user: {
     plan: user.plan,
     planStatus: user.planStatus,
     createdAt: user.createdAt,
+    isAdmin: isAdminEmail(user.email),
   };
 }
 

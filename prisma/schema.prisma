@@ -57,6 +57,8 @@ model User {
   alertPrefs        Json?
   /// Risk guardrails: daily loss limit and max trades per day (off by default).
   riskPrefs         Json?
+  /// Last authenticated request (updated at most every few minutes).
+  lastSeenAt        DateTime?
   notifications     Notification[]
   pushSubscriptions PushSubscription[]
 
@@ -242,4 +244,16 @@ model SignalEvent {
   createdAt    DateTime @default(now())
 
   @@unique([predictionId, kind])
+}
+
+/// A failed email/push delivery, for the admin page.
+model AlertFailure {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  channel   String
+  kind      String
+  error     String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }

@@ -208,6 +208,63 @@ function sleep(ms: number) {
   return new Promise((done) => setTimeout(done, ms));
 }
 
+// Daily tally (UTC day, as the provider counts it), persisted with the cache
+// so restarts don't reset it. Read by the admin page.
+const CREDITS_KEY = '__credits:daily';
+const DAILY_LIMIT = Math.max(
+  1,
+  Number(process.env.TWELVE_DATA_CREDITS_PER_DAY ?? 800)
+);
+
+async function countDailyCredits(cost: number) {
+  const map = await loadStore();
+  const day = new Date().toISOString().slice(0, 10);
+  const entry = map.get(CREDITS_KEY);
+  const prev = entry?.value as { day: string; used: number } | undefined;
+  const used = (prev?.day === day ? prev.used : 0) + cost;
+  map.set(CREDITS_KEY, {
+    value: { day, used },
+    hasValue: true,
+    expiresAt: Number.MAX_SAFE_INTEGER,
+  });
+  persist();
+}
+
+/** Provider credits spent today (UTC) and in the last minute, with limits. */
+export async function creditUsage() {
+  const map = await loadStore();
+  const day = new Date().toISOString().slice(0, 10);
+  const prev = map.get(CREDITS_KEY)?.value as
+    { day: string; used: number } | undefined;
+  const now = Date.now();
+  return {
+    day,
+    usedToday: prev?.day === day ? prev.used : 0,
+    dailyLimit: DAILY_LIMIT,
+    lastMinute: spentCredits.filter((t) => now - t < CREDIT_WINDOW_MS).length,
+    perMinuteLimit: CREDIT_LIMIT,
+  };
+}
+
+/** Newest candle time per cached series, for the admin page. */
+export async function cachedSeriesStatus() {
+  const map = await loadStore();
+  return [...map.entries()]
+    .filter(([key]) => key.startsWith('twelvedata:tf:'))
+    .map(([key, entry]) => {
+      const candles = (entry.value ?? []) as { datetime: string }[];
+      const newest = candles.length
+        ? candles.reduce((a, b) => (a.datetime > b.datetime ? a : b)).datetime
+        : null;
+      return {
+        key: key.replace('twelvedata:tf:', ''),
+        newest,
+        expiresAt: entry.expiresAt,
+        failedUntil: entry.failedUntil ?? null,
+      };
+    });
+}
+
 async function reserveCredits(cost: number) {
   const reservation = creditGate.then(async () => {
     for (;;) {
@@ -217,6 +274,7 @@ async function reserveCredits(cost: number) {
       );
       if (spentCredits.length + cost <= CREDIT_LIMIT) {
         for (let index = 0; index < cost; index += 1) spentCredits.push(now);
+        await countDailyCredits(cost);
         return;
       }
       await sleep(CREDIT_WINDOW_MS - (now - spentCredits[0]) + 50);

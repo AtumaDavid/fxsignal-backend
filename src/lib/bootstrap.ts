@@ -73,6 +73,18 @@ export async function bootstrapDatabase() {
       CONSTRAINT "SignalEvent_pkey" PRIMARY KEY ("id")
     )`,
     'CREATE UNIQUE INDEX IF NOT EXISTS "SignalEvent_predictionId_kind_key" ON "SignalEvent"("predictionId", "kind")',
+    // Admin page: failed alert deliveries and last activity per user.
+    `CREATE TABLE IF NOT EXISTS "AlertFailure" (
+      "id" SERIAL NOT NULL,
+      "userId" INTEGER,
+      "channel" TEXT NOT NULL,
+      "kind" TEXT NOT NULL,
+      "error" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "AlertFailure_pkey" PRIMARY KEY ("id")
+    )`,
+    'CREATE INDEX IF NOT EXISTS "AlertFailure_createdAt_idx" ON "AlertFailure"("createdAt")',
+    'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastSeenAt" TIMESTAMP(3)',
   ]) {
     await prisma
       .$executeRawUnsafe(sql)
