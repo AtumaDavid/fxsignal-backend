@@ -85,6 +85,20 @@ export async function bootstrapDatabase() {
     )`,
     'CREATE INDEX IF NOT EXISTS "AlertFailure_createdAt_idx" ON "AlertFailure"("createdAt")',
     'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastSeenAt" TIMESTAMP(3)',
+    `CREATE TABLE IF NOT EXISTS "BacktestRun" (
+      "id" SERIAL NOT NULL,
+      "status" TEXT NOT NULL,
+      "months" INTEGER NOT NULL,
+      "from" TIMESTAMP(3) NOT NULL,
+      "to" TIMESTAMP(3) NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "finishedAt" TIMESTAMP(3),
+      "summary" JSONB,
+      "trades" JSONB,
+      "error" TEXT,
+      CONSTRAINT "BacktestRun_pkey" PRIMARY KEY ("id")
+    )`,
+    'CREATE INDEX IF NOT EXISTS "BacktestRun_createdAt_idx" ON "BacktestRun"("createdAt")',
   ]) {
     await prisma
       .$executeRawUnsafe(sql)

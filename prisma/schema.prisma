@@ -257,3 +257,20 @@ model AlertFailure {
 
   @@index([createdAt])
 }
+
+/// A backtest of the rule engine over past months (see src/lib/backtest.ts).
+/// The newest DONE run is published on the track record page.
+model BacktestRun {
+  id         Int       @id @default(autoincrement())
+  status     String
+  months     Int
+  from       DateTime
+  to         DateTime
+  createdAt  DateTime  @default(now())
+  finishedAt DateTime?
+  summary    Json?
+  trades     Json?
+  error      String?
+
+  @@index([createdAt])
+}

@@ -8,6 +8,7 @@ import { cachedSeriesStatus, creditUsage } from '../lib/rateCache.js';
 import { getOpsStatus } from '../lib/predictions.js';
 import { PAIRS } from '../lib/market.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
+import { backtestRunning, startBacktest } from '../lib/backtest.js';
 
 /** Owner-only operations view. Mounted behind requireAuth + requireAdmin. */
 const router = Router();
@@ -205,6 +206,67 @@ router.patch(
       select: { id: true, plan: true },
     });
     res.json({ user });
+  })
+);
+
+// ---- Backtest ------------------------------------------------------------------
+
+router.get(
+  '/backtest',
+  asyncRoute(async (_req, res) => {
+    const runs = await prisma.backtestRun.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+      select: {
+        id: true,
+        status: true,
+        months: true,
+        from: true,
+        to: true,
+        createdAt: true,
+        finishedAt: true,
+        summary: true,
+        error: true,
+      },
+    });
+    res.json({
+      running: backtestRunning(),
+      runs: runs.map((r) => {
+        const summary = r.summary as {
+          trades?: number;
+          netR?: number;
+          winRate?: number | null;
+        } | null;
+        return {
+          ...r,
+          summary: summary
+            ? {
+                trades: summary.trades,
+                netR: summary.netR,
+                winRate: summary.winRate,
+              }
+            : null,
+        };
+      }),
+    });
+  })
+);
+
+const backtestSchema = z.object({
+  months: z.number().int().min(1).max(12).default(6),
+});
+
+/** Starts a run in the background (~7 provider credits per pair the first time). */
+router.post(
+  '/backtest',
+  asyncRoute(async (req, res) => {
+    const parsed = backtestSchema.safeParse(req.body ?? {});
+    if (!parsed.success)
+      return res.status(400).json({ error: 'Months must be 1–12.' });
+    if (backtestRunning())
+      return res.status(409).json({ error: 'A backtest is already running.' });
+    const id = await startBacktest(parsed.data.months);
+    res.status(202).json({ id });
   })
 );
 

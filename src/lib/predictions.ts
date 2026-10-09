@@ -1027,7 +1027,7 @@ export function settleFromCandles(
 }
 
 /** Outcome for a replayed path; `after`: decided after the signal's window. */
-function settleFromPath(
+export function settleFromPath(
   row: LevelRow,
   path: PathReplay,
   after = false

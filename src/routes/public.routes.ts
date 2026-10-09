@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { buildPerformance } from '../lib/performance.js';
 import { getHistory } from '../lib/predictions.js';
+import { prisma } from '../lib/prisma.js';
+import { asyncRoute } from '../middleware/asyncRoute.js';
 
 const router = Router();
 
@@ -67,5 +69,28 @@ router.get('/track-record', async (req, res) => {
       .json({ error: 'The track record is unavailable right now.' });
   }
 });
+
+/**
+ * The newest finished backtest: summary plus every simulated trade, so anyone
+ * can check the claim trade by trade.
+ */
+router.get(
+  '/backtest',
+  asyncRoute(async (_req, res) => {
+    const run = await prisma.backtestRun.findFirst({
+      where: { status: 'DONE' },
+      orderBy: { finishedAt: 'desc' },
+    });
+    if (!run)
+      return res.status(404).json({ error: 'No backtest published yet.' });
+    res.json({
+      id: run.id,
+      months: run.months,
+      finishedAt: run.finishedAt?.toISOString() ?? null,
+      summary: run.summary,
+      trades: run.trades,
+    });
+  })
+);
 
 export default router;
