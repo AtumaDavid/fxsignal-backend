@@ -55,6 +55,8 @@ model User {
   trades            UserTrade[]
   /// Alert channels and events (see src/lib/alerts.ts for the shape/defaults).
   alertPrefs        Json?
+  /// Risk guardrails: daily loss limit and max trades per day (off by default).
+  riskPrefs         Json?
   notifications     Notification[]
   pushSubscriptions PushSubscription[]
 

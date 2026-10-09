@@ -34,6 +34,8 @@ export async function bootstrapDatabase() {
     'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "target2Price" DECIMAL(16,6)',
     // Alerts + automatic journal exits. Same DDL `prisma db push` generates.
     'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "alertPrefs" JSONB',
+    // Risk guardrails (off by default).
+    'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "riskPrefs" JSONB',
     'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "stopPrice" DECIMAL(16,6)',
     'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "targetPrice" DECIMAL(16,6)',
     'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "exitedAt" TIMESTAMP(3)',
