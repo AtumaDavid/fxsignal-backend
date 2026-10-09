@@ -55,6 +55,14 @@ export interface LiveProgress {
   stopNow: number | null;
 }
 
+/** A scheduled high-impact release that can move a signal's pair. */
+export interface NewsRisk {
+  title: string;
+  currency: string;
+  at: string;
+  impact: Impact;
+}
+
 export interface Prediction {
   id: string;
   pairCode: PairCode;
@@ -88,6 +96,8 @@ export interface Prediction {
   outcome: PredictionOutcome | null;
   /** Only on currently active signals in the dashboard. */
   live?: LiveProgress | null;
+  /** High-impact releases for the pair's currencies around this signal. */
+  news?: NewsRisk[];
   /** "Hold" call: id of the still-open earlier signal this window manages. */
   continuesId: string | null;
   /**

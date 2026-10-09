@@ -12,6 +12,7 @@ import {
   type DashboardData,
   type Direction,
   type LiveProgress,
+  type NewsRisk,
   type OutcomeStatus,
   type MarketEvent,
   type PairCode,
@@ -2557,6 +2558,49 @@ async function peekPrices(): Promise<TickerPrice[]> {
   return out;
 }
 
+/** News this close to now (before or after) still matters for a signal. */
+const NEWS_LOOKBACK_MS = 30 * 60_000;
+
+/**
+ * High-impact releases for the pair's two currencies from 30 minutes ago to
+ * the end of the signal's window (at least the next 4 hours for a trade that
+ * is already running past its window).
+ */
+export function newsForSignal(
+  p: Prediction,
+  events: {
+    title: string;
+    currency: string;
+    eventDate: Date;
+    impact: string;
+  }[],
+  now: Date
+): NewsRisk[] {
+  if (p.direction === 'NEUTRAL') return [];
+  const [base, quote] = p.pairCode.split('/');
+  const from = now.getTime() - NEWS_LOOKBACK_MS;
+  const until = Math.max(
+    new Date(p.expiresAt).getTime(),
+    now.getTime() + 4 * 3_600_000
+  );
+  return events
+    .filter(
+      (e) =>
+        e.impact === 'HIGH' &&
+        (e.currency === base || e.currency === quote) &&
+        e.eventDate.getTime() >= from &&
+        e.eventDate.getTime() <= until
+    )
+    .sort((a, b) => a.eventDate.getTime() - b.eventDate.getTime())
+    .slice(0, 3)
+    .map((e) => ({
+      title: e.title,
+      currency: e.currency,
+      at: e.eventDate.toISOString(),
+      impact: e.impact as NewsRisk['impact'],
+    }));
+}
+
 export async function getDashboardFromDatabase(
   now = new Date()
 ): Promise<DashboardData> {
@@ -2651,13 +2695,32 @@ export async function getDashboardFromDatabase(
     })
   );
 
+  // News risk for every signal still in play (cheap: one indexed query).
+  const newsRows = await prisma.marketEvent.findMany({
+    where: {
+      impact: 'HIGH',
+      eventDate: {
+        gte: new Date(now.getTime() - NEWS_LOOKBACK_MS),
+        lte: new Date(now.getTime() + 24 * 3_600_000),
+      },
+    },
+    orderBy: { eventDate: 'asc' },
+  });
+  const decided = (p: Prediction) =>
+    ['target', 'stopped'].includes(p.live?.state ?? '') ||
+    (p.outcome?.status !== undefined && p.outcome.status !== 'PENDING');
+  const withNews = (p: Prediction): Prediction => ({
+    ...p,
+    news: decided(p) ? [] : newsForSignal(p, newsRows, now),
+  });
+
   return {
     ...empty,
     marketStatus: open ? 'OPEN' : 'CLOSED',
-    predictions: [...withLive, ...carried].sort((a, b) =>
-      a.pairCode.localeCompare(b.pairCode)
-    ),
-    openTrades,
+    predictions: [...withLive, ...carried]
+      .map(withNews)
+      .sort((a, b) => a.pairCode.localeCompare(b.pairCode)),
+    openTrades: openTrades.map(withNews),
     history,
     events: eventRows.map(eventFromRow),
     prices,
