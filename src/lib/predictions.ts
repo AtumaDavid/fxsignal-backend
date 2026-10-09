@@ -121,7 +121,18 @@ export function fromRow(row: DbPrediction): Prediction {
     entryLow: Number(row.entryLow),
     entryHigh: Number(row.entryHigh),
     targetPrice: Number(row.targetPrice),
-    target2Price: row.target2Price === null ? null : Number(row.target2Price),
+    target1Price:
+      row.target3Price === null
+        ? null
+        : roundToPip(
+            row.pairCode as PairCode,
+            firstTarget({
+              entryLow: Number(row.entryLow),
+              entryHigh: Number(row.entryHigh),
+              invalidationPrice: Number(row.invalidationPrice),
+            })
+          ),
+    target3Price: row.target3Price === null ? null : Number(row.target3Price),
     invalidationPrice: Number(row.invalidationPrice),
     rationale: row.rationale,
     factors: Array.isArray(row.factors)
@@ -476,14 +487,14 @@ export function riskFor(levels: {
   };
 }
 
-/** TP2 sits one more R beyond TP1 (3R when TP1 is the 2R minimum). */
-const TP2_EXTRA_R = 1;
+/** TP3 sits one more R beyond TP2 (3R when TP2 is the 2R minimum). */
+const TP3_EXTRA_R = 1;
 
 /**
- * The runner target for a trade: TP1 + 1R, rounded outward to the pip.
- * Stand-asides have none.
+ * The last target of a trade: TP2 (the published 2R target) + 1R, rounded
+ * outward to the pip. TP1 is +1R and is derived. Stand-asides have none.
  */
-export function secondTarget(levels: {
+export function finalTarget(levels: {
   pairCode: PairCode;
   direction: Direction;
   entryLow: number;
@@ -497,7 +508,7 @@ export function secondTarget(levels: {
   const mid = (levels.entryLow + levels.entryHigh) / 2;
   const risk = Math.abs(mid - levels.invalidationPrice);
   if (risk <= 0) return null;
-  const raw = levels.targetPrice + (long ? 1 : -1) * risk * TP2_EXTRA_R;
+  const raw = levels.targetPrice + (long ? 1 : -1) * risk * TP3_EXTRA_R;
   return roundToPip(
     levels.pairCode,
     long
@@ -574,7 +585,14 @@ function toPrediction(
     entryLow,
     entryHigh,
     targetPrice,
-    target2Price: secondTarget({
+    target1Price:
+      direction === 'NEUTRAL'
+        ? null
+        : roundToPip(
+            signal.pairCode,
+            firstTarget({ entryLow, entryHigh, invalidationPrice })
+          ),
+    target3Price: finalTarget({
       pairCode: signal.pairCode,
       direction,
       entryLow,
@@ -618,7 +636,7 @@ async function insertPrediction(prediction: Prediction) {
       entryLow: prediction.entryLow,
       entryHigh: prediction.entryHigh,
       targetPrice: prediction.targetPrice,
-      target2Price: prediction.target2Price,
+      target3Price: prediction.target3Price,
       invalidationPrice: prediction.invalidationPrice,
       rationale: prediction.rationale,
       factors: prediction.factors,
@@ -766,19 +784,20 @@ interface LevelRow {
   direction: string;
   entryLow: number;
   entryHigh: number;
+  /** TP2 on managed trades (the 2R target); the single target otherwise. */
   targetPrice: number;
   invalidationPrice: number;
-  /** Set on managed trades (TP1/TP2 + breakeven); absent on older signals. */
-  target2Price?: number | null;
+  /** TP3. Set on managed trades (three targets); absent on older signals. */
+  target3Price?: number | null;
 }
 
 export interface PathReplay {
   /**
    * neutral: not a trade · waiting: entry not reached · running: filled, open ·
-   * target: won (TP2, or TP1 then the rest at entry) · stopped: full stop ·
-   * breakeven: +1R reached, then closed at entry.
+   * target: closed in profit (TP3, or a trailed stop after TP1/TP2) ·
+   * stopped: the original stop.
    */
-  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped' | 'breakeven';
+  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped';
   /** Start of the candle where the entry zone first traded (ms). */
   filledAt: number | null;
   /** Start of the candle where the trade closed (ms). */
@@ -786,22 +805,25 @@ export interface PathReplay {
   lastClose: number | null;
   /**
    * Signed pips for the whole position from the zone midpoint: at the exit
-   * when decided, at the last close while running. A managed trade books half
-   * at TP1, so its pips blend the two halves.
+   * when decided, at the last close while running. A managed trade books a
+   * third at each target, so its pips blend the thirds.
    */
   pips: number | null;
-  /** Start of the candle where +1R traded and the stop moved to entry (ms). */
-  breakevenAt: number | null;
-  /** Start of the candle where TP1 traded and half was booked (ms). */
+  /** Targets reached so far (0–3). */
+  tpHits: number;
+  /** Start of the candles where TP1 / TP2 traded (ms). */
   tp1At: number | null;
-  /** True once the runner reached TP2. */
-  tp2Hit: boolean;
-  /** Where the stop is now: the original, or the entry once breakeven is on. */
+  tp2At: number | null;
+  /** Where the stop is now: original → entry after TP1 → TP1 after TP2. */
   stopNow: number | null;
 }
 
-/** Breakeven trigger: price at +1R from the zone midpoint. */
-export function breakevenTrigger(row: LevelRow): number {
+/** TP1 of a managed trade: +1R from the zone midpoint. */
+export function firstTarget(row: {
+  entryLow: number;
+  entryHigh: number;
+  invalidationPrice: number;
+}): number {
   const mid = (row.entryLow + row.entryHigh) / 2;
   return mid + (mid - row.invalidationPrice);
 }
@@ -814,12 +836,11 @@ export function breakevenTrigger(row: LevelRow): number {
  * - after the fill, whichever of stop or target is touched first decides the
  *   result; when both fall inside one candle the stop is assumed first;
  * - NEUTRAL calls are a stand-aside, not a trade.
- * Managed trades (with a TP2) follow the plan on top of that:
- * - at +1R the stop moves to the entry (from the next candle on: inside one
- *   candle the order of high and low is unknown);
- * - at TP1 half is booked, the stop stays at entry, the rest runs to TP2;
- * - result: −1R at the stop, 0 at breakeven, ½·TP1 at TP1-then-entry,
- *   ½·TP1 + ½·TP2 at TP2.
+ * Managed trades (with a TP3) take a third off at each target and trail the
+ * stop: to the entry after TP1, to TP1 after TP2. A new stop applies from the
+ * next candle (inside one candle the order of high and low is unknown).
+ * Result for the whole position: −1R at the stop, +⅓R after TP1, +1⅓R after
+ * TP2, +2R at TP3 (with TP1/TP2/TP3 at 1R/2R/3R).
  * Used both to settle expired signals and to show live progress, so the two
  * can never disagree.
  */
@@ -832,9 +853,9 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
     closedAt: null,
     lastClose,
     pips: null,
-    breakevenAt: null,
+    tpHits: 0,
     tp1At: null,
-    tp2Hit: false,
+    tp2At: null,
     stopNow: null,
   };
   if (row.direction === 'NEUTRAL') return { ...base, state: 'neutral' };
@@ -849,29 +870,35 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
   const below = (candle: Candle, level: number) =>
     isLong ? candle.low <= level : candle.high >= level;
 
-  const tp2 = row.target2Price ?? null;
-  const managed = tp2 !== null && Number.isFinite(tp2);
-  const beTrigger = breakevenTrigger(row);
-  const tp1Pips = signed(row.targetPrice);
+  const tp3 = row.target3Price ?? null;
+  const managed = tp3 !== null && Number.isFinite(tp3);
+  const targets = managed
+    ? [firstTarget(row), row.targetPrice, tp3!]
+    : [row.targetPrice];
+  // Share of the position closed at each target.
+  const share = 1 / targets.length;
 
   let filledAt: number | null = null;
-  let breakevenAt: number | null = null;
-  let tp1At: number | null = null;
-  const done = (
+  let tpHits = 0;
+  const hitAt: (number | null)[] = [null, null];
+  let booked = 0;
+  let stop = row.invalidationPrice;
+  let nextStop: number | null = null;
+  const result = (
     state: PathReplay['state'],
-    at: number,
-    pips: number,
-    tp2Hit = false
+    at: number | null,
+    pips: number | null,
+    stopNow: number | null
   ): PathReplay => ({
     state,
     filledAt,
     closedAt: at,
     lastClose,
-    pips: round(pips),
-    breakevenAt,
-    tp1At,
-    tp2Hit,
-    stopNow: null,
+    pips: pips === null ? null : round(pips),
+    tpHits,
+    tp1At: hitAt[0],
+    tp2At: hitAt[1],
+    stopNow,
   });
 
   for (const candle of candles) {
@@ -880,61 +907,39 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
       if (candle.low > row.entryHigh || candle.high < row.entryLow) continue;
       filledAt = t;
     }
-    // Breakeven/TP1 recorded on an earlier candle protect this one.
-    const stopLevel = breakevenAt !== null && breakevenAt < t ? fill : null;
-
-    if (!managed) {
-      const stopHit = below(candle, row.invalidationPrice);
-      if (stopHit || above(candle, row.targetPrice)) {
-        return stopHit
-          ? done('stopped', t, signed(row.invalidationPrice))
-          : done('target', t, signed(row.targetPrice));
-      }
-      continue;
+    // A stop trailed on an earlier candle protects this one.
+    if (nextStop !== null) {
+      stop = nextStop;
+      nextStop = null;
     }
-
-    if (tp1At === null) {
-      // Before TP1: the original stop, or the entry once breakeven is on.
-      if (below(candle, stopLevel ?? row.invalidationPrice)) {
-        return stopLevel === null
-          ? done('stopped', t, signed(row.invalidationPrice))
-          : done('breakeven', t, 0);
-      }
-      if (above(candle, row.targetPrice)) {
-        tp1At = t;
-        breakevenAt ??= t;
-        // TP2 in the same candle: price passed TP1 on the way, so both count.
-        if (above(candle, tp2!))
-          return done('target', t, tp1Pips / 2 + signed(tp2!) / 2, true);
-        continue;
-      }
-      if (breakevenAt === null && above(candle, beTrigger)) breakevenAt = t;
-      continue;
+    if (below(candle, stop)) {
+      const remaining = 1 - tpHits * share;
+      return result(
+        tpHits === 0 ? 'stopped' : 'target',
+        t,
+        booked + remaining * signed(stop),
+        null
+      );
     }
-
-    // After TP1: the runner, stop at entry from the next candle on.
-    if (tp1At < t && below(candle, fill)) return done('target', t, tp1Pips / 2);
-    if (above(candle, tp2!))
-      return done('target', t, tp1Pips / 2 + signed(tp2!) / 2, true);
+    // Targets in order; a fast candle can take several.
+    while (tpHits < targets.length && above(candle, targets[tpHits])) {
+      booked += share * signed(targets[tpHits]);
+      if (tpHits < 2) hitAt[tpHits] = t;
+      tpHits += 1;
+      // Trail: entry after TP1, TP1 after TP2.
+      if (managed && tpHits < targets.length)
+        nextStop = tpHits === 1 ? fill : targets[0];
+    }
+    if (tpHits === targets.length) return result('target', t, booked, null);
   }
   if (filledAt === null) return { ...base, state: 'waiting' };
-  const open =
-    lastClose === null
-      ? null
-      : tp1At !== null
-        ? tp1Pips / 2 + signed(lastClose) / 2
-        : signed(lastClose);
-  return {
-    state: 'running',
-    filledAt,
-    closedAt: null,
-    lastClose,
-    pips: open === null ? null : round(open),
-    breakevenAt,
-    tp1At,
-    tp2Hit: false,
-    stopNow: breakevenAt !== null ? fill : row.invalidationPrice,
-  };
+  const remaining = 1 - tpHits * share;
+  return result(
+    'running',
+    null,
+    lastClose === null ? null : booked + remaining * signed(lastClose),
+    nextStop ?? stop
+  );
 }
 
 /**
@@ -966,14 +971,15 @@ async function liveProgress(
       ? (p.direction === 'LONG' ? path.lastClose - mid : mid - path.lastClose) /
         pipSize(p.pairCode)
       : path.pips;
-  const finalPips = p.target2Price
-    ? toPips(p.pairCode, p.target2Price - mid)
+  const finalPips = p.target3Price
+    ? toPips(p.pairCode, p.target3Price - mid)
     : p.targetPips;
+  const targetCount = p.target3Price ? 3 : 1;
   const progress =
     path.state === 'target'
-      ? 100
-      : path.state === 'breakeven'
-        ? 0
+      ? (path.tpHits / targetCount) * 100
+      : path.state === 'stopped'
+        ? -100
         : priceMove === null
           ? null
           : priceMove >= 0
@@ -994,19 +1000,21 @@ async function liveProgress(
     asOf: new Date(
       candleTime(candles[candles.length - 1]) + span
     ).toISOString(),
-    breakevenAt: iso(path.breakevenAt),
+    tpHits: path.tpHits,
     tp1At: iso(path.tp1At),
-    tp2Hit: path.tp2Hit,
+    tp2At: iso(path.tp2At),
     stopNow: path.stopNow,
   };
 }
 
-function targetNote(path: PathReplay, after = false) {
+function targetNote(path: PathReplay, managed: boolean, after = false) {
   const when = after ? ' after the window closed' : '';
-  if (path.tp2Hit) return `TP1 and TP2 reached${when} — half booked at each.`;
-  if (path.tp1At !== null)
-    return `TP1 reached${when} (half booked); the rest closed at entry.`;
-  return `Target reached before the invalidation level${when}.`;
+  if (!managed) return `Target reached before the invalidation level${when}.`;
+  if (path.tpHits >= 3)
+    return `TP1, TP2 and TP3 reached${when} — a third booked at each.`;
+  if (path.tpHits === 2)
+    return `TP1 and TP2 reached${when} (two thirds booked); the last third closed at TP1.`;
+  return `TP1 reached${when} (a third booked); the rest closed at entry.`;
 }
 
 /** Final outcome for an expired signal from its window's candles. */
@@ -1041,24 +1049,23 @@ function settleFromPath(
         movementPips: path.pips,
         note: `Invalidation level traded before the target${followed}.`,
       };
-    case 'breakeven':
-      return {
-        status: 'BREAKEVEN',
-        resolvedPrice: (row.entryLow + row.entryHigh) / 2,
-        movementPips: 0,
-        note: `Reached +1R, stop moved to entry, then closed there${followed} — no loss.`,
-      };
-    case 'target':
+    case 'target': {
+      const managed = Boolean(row.target3Price);
+      // The price the last part of the position closed at.
+      const lastExit = !managed
+        ? row.targetPrice
+        : path.tpHits >= 3
+          ? row.target3Price!
+          : path.tpHits === 2
+            ? firstTarget(row)
+            : (row.entryLow + row.entryHigh) / 2;
       return {
         status: 'HIT',
-        resolvedPrice: path.tp2Hit
-          ? (row.target2Price ?? row.targetPrice)
-          : path.tp1At !== null
-            ? (row.entryLow + row.entryHigh) / 2
-            : row.targetPrice,
+        resolvedPrice: lastExit,
         movementPips: path.pips,
-        note: targetNote(path, after),
+        note: targetNote(path, managed, after),
       };
+    }
     case 'waiting':
       return {
         status: 'EXPIRED',
@@ -1206,9 +1213,7 @@ export async function evaluateExpiredPredictions(
         ? 'TARGET_HIT'
         : data.status === 'MISSED'
           ? 'STOP_HIT'
-          : data.status === 'BREAKEVEN'
-            ? 'BREAKEVEN_HIT'
-            : null;
+          : null;
     if (kind) {
       await announceSignalEvent(
         kind,
@@ -1228,7 +1233,7 @@ export async function evaluateExpiredPredictions(
       entryLow: Number(row.entryLow),
       entryHigh: Number(row.entryHigh),
       targetPrice: Number(row.targetPrice),
-      target2Price: row.target2Price === null ? null : Number(row.target2Price),
+      target3Price: row.target3Price === null ? null : Number(row.target3Price),
       invalidationPrice: Number(row.invalidationPrice),
     };
 
@@ -1288,11 +1293,7 @@ export async function evaluateExpiredPredictions(
           candleTime(c) < until.getTime()
       );
     const path = replayPath(levels, all);
-    if (
-      path.state === 'target' ||
-      path.state === 'stopped' ||
-      path.state === 'breakeven'
-    ) {
+    if (path.state === 'target' || path.state === 'stopped') {
       await store(row, settleFromPath(levels, path, true));
       continue;
     }
@@ -1539,8 +1540,8 @@ export async function manageOnH1Close(now = new Date()) {
       if (path.state !== 'waiting' && path.state !== 'running') continue;
       // An unfilled signal whose window is over is just "no position".
       if (path.state === 'waiting' && row.expiresAt <= now) continue;
-      // Stop already at entry: the trade can no longer lose, let it run.
-      if (path.breakevenAt !== null) continue;
+      // Stop already at entry (TP1 taken): it can no longer lose, let it run.
+      if (path.tpHits > 0) continue;
 
       const decision = decideOnH1Close({
         direction: p.direction as 'LONG' | 'SHORT',
@@ -1752,15 +1753,17 @@ export async function getOrCreatePredictions(
       const live = await liveProgress(fromRow(active));
       if (
         !live ||
-        (live.state !== 'target' &&
-          live.state !== 'stopped' &&
-          live.state !== 'breakeven') ||
+        (live.state !== 'target' && live.state !== 'stopped') ||
         !live.closedAt
       )
         continue;
       checkAt = nextH1Close(live.closedAt);
-      // A scratch at entry means price came back: H1 must agree again.
-      after = live.state === 'target' ? 'target' : 'stopped';
+      // Closed at a trailed stop means price came back: H1 must agree again.
+      const allTargets = active.target3Price === null ? 1 : 3;
+      after =
+        live.state === 'target' && live.tpHits >= allTargets
+          ? 'target'
+          : 'stopped';
     }
     if (
       now < checkAt ||
@@ -2406,22 +2409,21 @@ async function trackOnM15Close(now: Date) {
       announceSignalEvent(kind, p, extra, { silent: stale(at) }).catch(
         () => undefined
       );
-    // In order, so a fast move still reads as a story.
+    // Every step, in order, so a fast move still reads as a story.
+    const managed = p.target3Price !== null;
     await announce('ENTRY_FILLED', path.filledAt);
-    if (path.breakevenAt !== null && path.tp1At === null)
-      await announce('BREAKEVEN_SET', path.breakevenAt);
-    // TP1 and TP2 in one candle: the final alert covers both.
-    if (path.tp1At !== null && !(path.tp2Hit && path.closedAt === path.tp1At))
-      await announce('TP1_HIT', path.tp1At);
-    if (path.state === 'target')
-      await announce('TARGET_HIT', path.closedAt, {
-        pips: path.pips,
-        note: targetNote(path),
-      });
-    else if (path.state === 'stopped')
+    if (managed && path.tpHits >= 1) await announce('TP1_HIT', path.tp1At);
+    if (managed && path.tpHits >= 2) await announce('TP2_HIT', path.tp2At);
+    if (path.state === 'stopped')
       await announce('STOP_HIT', path.closedAt, { pips: path.pips });
-    else if (path.state === 'breakeven')
-      await announce('BREAKEVEN_HIT', path.closedAt, { pips: 0 });
+    else if (path.state === 'target') {
+      const done = !managed || path.tpHits >= 3;
+      await announce(
+        !managed ? 'TARGET_HIT' : done ? 'TP3_HIT' : 'TRAIL_STOP_HIT',
+        path.closedAt,
+        { pips: path.pips, note: targetNote(path, managed) }
+      );
+    }
   }
 
   // Users' own trades: exit detected at their stop or target.

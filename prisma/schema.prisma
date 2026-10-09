@@ -83,9 +83,10 @@ model Prediction {
   entryLow          Decimal            @db.Decimal(16, 6)
   entryHigh         Decimal            @db.Decimal(16, 6)
   targetPrice       Decimal            @db.Decimal(16, 6)
-  /// Second target (runner). Set on managed trades: half off at TP1
-  /// (targetPrice), stop to entry at +1R, the rest runs to TP2.
-  target2Price      Decimal?           @db.Decimal(16, 6)
+  /// TP3. Set on managed trades: a third off at TP1 (+1R, derived), TP2
+  /// (targetPrice) and TP3; the stop trails to entry, then to TP1.
+  /// Stored in the column first created as "target2Price".
+  target3Price      Decimal?           @map("target2Price") @db.Decimal(16, 6)
   invalidationPrice Decimal            @db.Decimal(16, 6)
   rationale         String
   factors           Json

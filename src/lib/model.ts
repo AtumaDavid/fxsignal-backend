@@ -31,30 +31,28 @@ export interface TimeframeVote {
 /** Where an open signal stands right now, replayed from the newest M15 candles. */
 export interface LiveProgress {
   /**
-   * target: won (TP2, or TP1 then the rest at entry) · stopped: full stop ·
-   * breakeven: +1R reached, then closed at entry for 0.
+   * target: closed in profit (TP3, or the trailed stop after TP1/TP2) ·
+   * stopped: the original stop.
    */
-  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped' | 'breakeven';
+  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped';
   filledAt: string | null;
   closedAt: string | null;
   /**
    * Signed pips for the whole position from the zone midpoint (exit once
-   * decided). With TP1/TP2 it blends the half booked at TP1 with the rest.
+   * decided). With three targets it blends the thirds already booked.
    */
   pips: number | null;
   /** −100 (at the stop) … +100 (at the final target). */
   progress: number | null;
-  /** When +1R traded and the stop moved to entry. */
-  breakevenAt: string | null;
-  /** When TP1 traded and half was booked. */
-  tp1At: string | null;
-  /** The runner reached TP2. */
-  tp2Hit: boolean;
-  /** Where the stop is now (the entry once breakeven is on). */
-  stopNow: number | null;
   lastPrice: number | null;
   /** End of the newest candle the replay used. */
   asOf: string | null;
+  /** Targets reached so far (0–3). */
+  tpHits: number;
+  tp1At: string | null;
+  tp2At: string | null;
+  /** Where the stop is now: original → entry after TP1 → TP1 after TP2. */
+  stopNow: number | null;
 }
 
 export interface Prediction {
@@ -68,8 +66,10 @@ export interface Prediction {
   entryLow: number;
   entryHigh: number;
   targetPrice: number;
-  /** TP2 (runner). Null on older single-target signals and stand-asides. */
-  target2Price: number | null;
+  /** TP1 (+1R). Null on older single-target signals and stand-asides. */
+  target1Price: number | null;
+  /** TP3 (+1R beyond TP2). Null on older single-target signals and stand-asides. */
+  target3Price: number | null;
   invalidationPrice: number;
   rationale: string;
   factors: string[];
