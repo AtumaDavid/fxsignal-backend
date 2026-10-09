@@ -31,6 +31,7 @@ type TradeRow = {
   exitedAt: Date | null;
   exitReason: string | null;
   notes: string | null;
+  source?: string | null;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -66,6 +67,7 @@ function toTrade(row: TradeRow, prediction: Prediction) {
     exitedAt: row.exitedAt?.toISOString() ?? null,
     exitReason: row.exitReason,
     notes: row.notes,
+    source: row.source ?? null,
     pips: tradePips(prediction.pairCode, row.side, entryPrice, exitPrice),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

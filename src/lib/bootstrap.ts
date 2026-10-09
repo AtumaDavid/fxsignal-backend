@@ -99,6 +99,24 @@ export async function bootstrapDatabase() {
       CONSTRAINT "BacktestRun_pkey" PRIMARY KEY ("id")
     )`,
     'CREATE INDEX IF NOT EXISTS "BacktestRun_createdAt_idx" ON "BacktestRun"("createdAt")',
+    // MT5 read-only sync.
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "source" TEXT',
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "externalRef" TEXT',
+    `CREATE TABLE IF NOT EXISTS "Mt5Link" (
+      "id" SERIAL NOT NULL,
+      "userId" INTEGER NOT NULL,
+      "tokenHash" TEXT NOT NULL,
+      "tokenHint" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "lastSyncAt" TIMESTAMP(3),
+      "lastAccount" TEXT,
+      "lastBroker" TEXT,
+      "lastPositions" INTEGER,
+      "lastMatched" INTEGER,
+      CONSTRAINT "Mt5Link_pkey" PRIMARY KEY ("id")
+    )`,
+    'CREATE UNIQUE INDEX IF NOT EXISTS "Mt5Link_userId_key" ON "Mt5Link"("userId")',
+    'CREATE UNIQUE INDEX IF NOT EXISTS "Mt5Link_tokenHash_key" ON "Mt5Link"("tokenHash")',
   ]) {
     await prisma
       .$executeRawUnsafe(sql)

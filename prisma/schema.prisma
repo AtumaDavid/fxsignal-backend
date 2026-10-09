@@ -196,9 +196,14 @@ model UserTrade {
   stopPrice    Decimal?   @db.Decimal(16, 6)
   targetPrice  Decimal?   @db.Decimal(16, 6)
   exitedAt     DateTime?
-  /// "stop" | "target" when detected automatically, "manual" when typed in.
+  /// "stop" | "target" when detected automatically, "manual" when typed in,
+  /// "mt5" when synced from MetaTrader.
   exitReason   String?
   notes        String?
+  /// "mt5" for trades synced from MetaTrader; null when logged by hand.
+  source       String?
+  /// MT5 position ids behind this trade (comma-separated).
+  externalRef  String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -273,4 +278,19 @@ model BacktestRun {
   error      String?
 
   @@index([createdAt])
+}
+
+/// MetaTrader 5 read-only sync: one key per user, used by the FXSignal Sync EA.
+model Mt5Link {
+  id            Int       @id @default(autoincrement())
+  userId        Int       @unique
+  /// sha256 of the sync key; the key itself is shown once and never stored.
+  tokenHash     String    @unique
+  tokenHint     String
+  createdAt     DateTime  @default(now())
+  lastSyncAt    DateTime?
+  lastAccount   String?
+  lastBroker    String?
+  lastPositions Int?
+  lastMatched   Int?
 }

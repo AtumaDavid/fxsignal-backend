@@ -2383,6 +2383,8 @@ async function trackOnM15Close(now: Date) {
       where: {
         exitPrice: null,
         OR: [{ stopPrice: { not: null } }, { targetPrice: { not: null } }],
+        // MT5-synced trades close from the broker's own fills.
+        AND: [{ OR: [{ source: null }, { source: { not: 'mt5' } }] }],
         prediction: { validFrom: { gte: since } },
       },
       include: { prediction: { include: { outcome: true } } },

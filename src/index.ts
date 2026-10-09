@@ -24,6 +24,7 @@ import notificationsRoutes from './routes/notifications.routes.js';
 import recapRoutes from './routes/recap.routes.js';
 import riskRoutes from './routes/risk.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import { mt5Router, mt5SyncRouter } from './routes/mt5.routes.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 4004;
@@ -97,6 +98,8 @@ app.use('/api/notifications', requireAuth, notificationsRoutes);
 app.use('/api/recap', requireAuth, recapRoutes);
 app.use('/api/risk', requireAuth, riskRoutes);
 app.use('/api/admin', requireAuth, requireAdmin, adminRoutes);
+app.use('/api/mt5/sync', rateLimit(30, 60_000), mt5SyncRouter);
+app.use('/api/mt5', requireAuth, mt5Router);
 // Unauthenticated, so it gets its own per-IP budget.
 app.use('/api/public', rateLimit(60, 60_000), publicRoutes);
 app.use('/api/billing', billingRoutes);
