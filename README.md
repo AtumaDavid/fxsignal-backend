@@ -60,6 +60,8 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `GET` | `/api/history/performance?days=` | ✓ | Hit rate, net pips, breakdowns, pips curve |
 | `GET` | `/api/candles?pair=&timeframe=` | ✓ | Cached candles for charts (never calls the provider) |
 | `GET` / `PUT` / `DELETE` | `/api/journal`, `/api/journal/:predictionId` | ✓ | Personal trade journal |
+| `GET` / `PUT` | `/api/notifications`, `/api/notifications/settings` | ✓ | Alert bell feed / alert channels and events |
+| `POST` | `/api/notifications/read`, `/push/subscribe`, `/push/unsubscribe`, `/test` | ✓ | Mark read, browser push devices, send a test alert |
 | `GET` | `/api/public/track-record?days=30\|90\|365` | — | Public track record (60/min per IP, cached 5 min) |
 | `GET` | `/api/billing/plans`, `/api/billing/account` | –/✓ | Plans and usage |
 | `POST` | `/api/billing/checkout` | ✓ | Change plan (simulated; connect Stripe before taking payments) |
@@ -74,6 +76,7 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 - **Model review:** DeepSeek may keep or downgrade the direction, never flip it; its levels are pushed to 2R or replaced by the engine's.
 - **Settlement:** each signal is replayed on M15 candles (H1 fallback). No fill in its window means no trade. A filled trade is followed after its window, even when newer signals appear, until target or stop trades (stop first if both share a candle), or the Friday close, where it is marked to the last price. Neutral calls are never scored.
 - **H1 checkpoint:** on every closed H1 candle, open signals and trades are re-checked (no model calls, ~1 Twelve Data credit per pair per hour while something is open). Before entry, a broken setup (H1 against the context, context flipped, or a close beyond the stop) is `CANCELLED` and not scored; the pair is re-read at a later H1 close with H1 required to agree again. After entry, a trade is `CLOSED_EARLY` only when the same H1 close is back through the far side of the entry zone and H1 or H4 points against it; early exits count in net pips but not the hit rate.
+- **Candle-close loop & alerts:** a per-minute loop acts once per closed M15 candle (and runs the H1 checkpoint once per H1 close), only while something is open. It announces new signals, entry fills, targets/stops, cancellations and early exits once each (`SignalEvent` dedupe), and closes users' journal trades at their own stop/target. Alerts go to the in-app bell (always), email (`SMTP_*`) and browser push (`VAPID_*`) per user preferences; events older than 2 hours are logged without alerting.
 - **Holds:** if a new window points the same way as a trade still open on that pair, it is published as a hold (`continuesId` → the open trade): no second entry, not scored separately. An opposite call carries a warning to close or reduce the open trade.
 - **Provider budget:** all provider calls go through a restart-safe cache with single-flight requests, failure back-off and a per-minute credit budget. Web requests read the database only.
 

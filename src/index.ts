@@ -7,7 +7,7 @@ import express, {
 import cors from 'cors';
 import { bootstrapDatabase } from './lib/bootstrap.js';
 import { checkDatabase, prisma } from './lib/prisma.js';
-import { maintainMarketData } from './lib/predictions.js';
+import { maintainMarketData, onCandleClose } from './lib/predictions.js';
 import { requireAuth } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import authRoutes from './routes/auth.routes.js';
@@ -20,6 +20,7 @@ import billingRoutes from './routes/billing.routes.js';
 import candlesRoutes from './routes/candles.routes.js';
 import publicRoutes from './routes/public.routes.js';
 import journalRoutes from './routes/journal.routes.js';
+import notificationsRoutes from './routes/notifications.routes.js';
 
 const app = express();
 const port = Number(process.env.PORT) || 4004;
@@ -89,6 +90,7 @@ app.use('/api/history', requireAuth, historyRoutes);
 app.use('/api/outlook', requireAuth, outlookRoutes);
 app.use('/api/candles', requireAuth, candlesRoutes);
 app.use('/api/journal', requireAuth, journalRoutes);
+app.use('/api/notifications', requireAuth, notificationsRoutes);
 // Unauthenticated, so it gets its own per-IP budget.
 app.use('/api/public', rateLimit(60, 60_000), publicRoutes);
 app.use('/api/billing', billingRoutes);
@@ -149,6 +151,16 @@ async function start() {
   };
   runMaintenance();
   const maintenanceTimer = setInterval(runMaintenance, MAINTENANCE_INTERVAL_MS);
+  // Candle-close loop: cheap when idle (it acts once per M15 / H1 close and
+  // only when something is open), so it can check every minute.
+  const candleTimer = setInterval(() => {
+    onCandleClose().catch((error) =>
+      console.warn(
+        'Candle-close loop failed.',
+        error instanceof Error ? error.message : error
+      )
+    );
+  }, 60_000);
 
   const server = app.listen(port, () => {
     console.log(`FXSignal API listening on http://localhost:${port}`);
@@ -157,6 +169,7 @@ async function start() {
   const shutdown = (signal: string) => {
     console.log(`${signal} received, shutting down.`);
     clearInterval(maintenanceTimer);
+    clearInterval(candleTimer);
     server.close(() => {
       void prisma.$disconnect().finally(() => process.exit(0));
     });

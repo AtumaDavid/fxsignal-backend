@@ -29,6 +29,45 @@ export async function bootstrapDatabase() {
     'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "continuesId" INTEGER',
     `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CANCELLED'`,
     `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CLOSED_EARLY'`,
+    // Alerts + automatic journal exits. Same DDL `prisma db push` generates.
+    'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "alertPrefs" JSONB',
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "stopPrice" DECIMAL(16,6)',
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "targetPrice" DECIMAL(16,6)',
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "exitedAt" TIMESTAMP(3)',
+    'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "exitReason" TEXT',
+    `CREATE TABLE IF NOT EXISTS "Notification" (
+      "id" SERIAL NOT NULL,
+      "userId" INTEGER NOT NULL,
+      "kind" TEXT NOT NULL,
+      "title" TEXT NOT NULL,
+      "body" TEXT NOT NULL,
+      "predictionId" INTEGER,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "readAt" TIMESTAMP(3),
+      CONSTRAINT "Notification_pkey" PRIMARY KEY ("id"),
+      CONSTRAINT "Notification_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    )`,
+    'CREATE INDEX IF NOT EXISTS "Notification_userId_createdAt_idx" ON "Notification"("userId", "createdAt")',
+    `CREATE TABLE IF NOT EXISTS "PushSubscription" (
+      "id" SERIAL NOT NULL,
+      "userId" INTEGER NOT NULL,
+      "endpoint" TEXT NOT NULL,
+      "p256dh" TEXT NOT NULL,
+      "auth" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "PushSubscription_pkey" PRIMARY KEY ("id"),
+      CONSTRAINT "PushSubscription_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    )`,
+    'CREATE UNIQUE INDEX IF NOT EXISTS "PushSubscription_endpoint_key" ON "PushSubscription"("endpoint")',
+    'CREATE INDEX IF NOT EXISTS "PushSubscription_userId_idx" ON "PushSubscription"("userId")',
+    `CREATE TABLE IF NOT EXISTS "SignalEvent" (
+      "id" SERIAL NOT NULL,
+      "predictionId" INTEGER NOT NULL,
+      "kind" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "SignalEvent_pkey" PRIMARY KEY ("id")
+    )`,
+    'CREATE UNIQUE INDEX IF NOT EXISTS "SignalEvent_predictionId_kind_key" ON "SignalEvent"("predictionId", "kind")',
   ]) {
     await prisma
       .$executeRawUnsafe(sql)

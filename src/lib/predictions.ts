@@ -68,6 +68,7 @@ import {
   type MultiTimeframe,
 } from './liveData.js';
 import { peekStale } from './rateCache.js';
+import { announceMyTradeClosed, announceSignalEvent } from './alerts.js';
 
 const pairs: PairCode[] = [...PAIRS];
 
@@ -988,9 +989,10 @@ export async function evaluateExpiredPredictions(
   }
 
   const store = async (
-    rowId: number,
+    row: DbPrediction,
     data: Settlement & { status: PrismaOutcomeStatus }
   ) => {
+    const rowId = row.id;
     try {
       await prisma.predictionOutcome.update({
         where: { predictionId: rowId },
@@ -1005,6 +1007,17 @@ export async function evaluateExpiredPredictions(
         `Unable to store the outcome for prediction ${rowId}.`,
         error instanceof Error ? error.message : error
       );
+      return;
+    }
+    // Usually already announced live by the M15 tracker; this is the backstop.
+    if (data.status === 'HIT' || data.status === 'MISSED') {
+      await announceSignalEvent(
+        data.status === 'HIT' ? 'TARGET_HIT' : 'STOP_HIT',
+        fromRow(row),
+        { pips: data.movementPips },
+        // Settled long after the fact (e.g. after downtime): log only.
+        { silent: now.getTime() - row.expiresAt.getTime() > STALE_ALERT_MS }
+      ).catch(() => undefined);
     }
   };
 
@@ -1021,7 +1034,7 @@ export async function evaluateExpiredPredictions(
 
     // A hold call manages an earlier open trade; it is never a trade itself.
     if (row.continuesId !== null) {
-      await store(row.id, {
+      await store(row, {
         status: 'EXPIRED',
         resolvedPrice: null,
         movementPips: null,
@@ -1047,7 +1060,7 @@ export async function evaluateExpiredPredictions(
     }
     if (!windowPath) {
       if (now.getTime() - row.expiresAt.getTime() > SETTLEMENT_GRACE_MS) {
-        await store(row.id, {
+        await store(row, {
           status: 'EXPIRED',
           resolvedPrice: null,
           movementPips: null,
@@ -1058,7 +1071,7 @@ export async function evaluateExpiredPredictions(
     }
     const inWindow = replayPath(levels, windowPath);
     if (inWindow.state !== 'running') {
-      await store(row.id, settleFromCandles(levels, windowPath));
+      await store(row, settleFromCandles(levels, windowPath));
       continue;
     }
 
@@ -1077,7 +1090,7 @@ export async function evaluateExpiredPredictions(
     const path = replayPath(levels, all);
     if (path.state === 'target' || path.state === 'stopped') {
       const hit = path.state === 'target';
-      await store(row.id, {
+      await store(row, {
         status: hit ? 'HIT' : 'MISSED',
         resolvedPrice: hit ? levels.targetPrice : levels.invalidationPrice,
         movementPips: path.pips,
@@ -1089,7 +1102,7 @@ export async function evaluateExpiredPredictions(
     }
     const lastEnd = all.length ? candleTime(all[all.length - 1]) + span : 0;
     if (now >= holdUntil && lastEnd >= holdUntil.getTime()) {
-      await store(row.id, {
+      await store(row, {
         status: 'EXPIRED',
         resolvedPrice: path.lastClose,
         movementPips: path.pips,
@@ -1099,7 +1112,7 @@ export async function evaluateExpiredPredictions(
     }
     // Still running: keep it open and record where it stands.
     openPairs.add(pair);
-    await store(row.id, {
+    await store(row, {
       status: 'PENDING',
       resolvedPrice: null,
       movementPips: path.pips,
@@ -1362,6 +1375,15 @@ export async function manageOnH1Close(now = new Date()) {
           },
         });
         console.info(`${pair} #${row.id}: ${decision.reason}`);
+        await announceSignalEvent(
+          decision.action === 'cancel' ? 'CANCELLED' : 'CLOSED_EARLY',
+          p,
+          {
+            price: last.close,
+            pips: decision.action === 'cancel' ? null : pips,
+            note: decision.reason,
+          }
+        ).catch(() => undefined);
       } catch (error) {
         console.warn(
           `Unable to record the H1 checkpoint for prediction ${row.id}.`,
@@ -1419,6 +1441,18 @@ export async function getCurrentPredictions(
       // generation (tiny entry zones, targets inside the zone). Idempotent — once
       // stored signals are sane, this is a no-op.
       .map((row) => normalizeLevels(fromRow(row)))
+  );
+}
+
+/** Announces a newly published trade (holds and stand-asides are not alerted). */
+async function announceNew(row: DbPrediction) {
+  const p = fromRow(row);
+  if (p.direction === 'NEUTRAL' || p.continuesId) return;
+  await announceSignalEvent('SIGNAL_NEW', p).catch((error) =>
+    console.warn(
+      'New-signal alert failed.',
+      error instanceof Error ? error.message : error
+    )
   );
 }
 
@@ -1591,12 +1625,13 @@ export async function getOrCreatePredictions(
             data: { expiresAt: now },
           });
         }
-        await insertPrediction({
+        const created = await insertPrediction({
           ...signal,
           windowKey: `${window.key}-${used + 1}`,
         });
+        await announceNew(created);
       } else {
-        await insertPrediction(signal);
+        await announceNew(await insertPrediction(signal));
       }
     } catch (error) {
       // Window race (unique pairCode + windowKey): keep what is stored.
@@ -2014,28 +2049,192 @@ export async function maintainMarketData(
 
 let maintenanceRun: Promise<void> | null = null;
 
-// Live progress reads cached M15 candles; this is the only thing that
-// refreshes them mid-window. One credit per pair per refresh, so the default
-// 30 minutes costs ~4 credits/hour while signals are open (~100/day on a
-// weekday, against the free plan's 800). LIVE_PROGRESS_REFRESH_MINUTES=0
-// turns it off — live progress then updates only when signals are generated.
-const LIVE_REFRESH_MS =
-  Math.max(0, Number(process.env.LIVE_PROGRESS_REFRESH_MINUTES ?? 30)) * 60_000;
-let lastLiveRefresh = 0;
+// ---- Candle-close loop ---------------------------------------------------------
+//
+// Runs every minute but only acts once per closed M15 candle, and only when
+// something is open:
+// - refreshes M15 for pairs with open signals / trades / journal trades
+//   (1 credit per pair per refresh; at most every LIVE_PROGRESS_REFRESH_MINUTES,
+//   default 15 → ~4 credits per pair per hour while something is open);
+// - announces entry fills, targets and stops as soon as they show up;
+// - closes users' journal trades at their own stop or target;
+// - runs the H1 checkpoint (it throttles itself to one pass per H1 close).
 
-async function refreshLiveCandles(pairsToTrack: Set<PairCode>, now: Date) {
-  if (LIVE_REFRESH_MS === 0 || pairsToTrack.size === 0) return;
-  if (now.getTime() - lastLiveRefresh < LIVE_REFRESH_MS) return;
-  lastLiveRefresh = now.getTime();
-  for (const pairCode of pairsToTrack) {
-    // Served from cache when it is still fresh (20-minute TTL), so this never
-    // buys the same series twice.
-    await fetchTimeframeCandles(pairCode, 'M15').catch((error) =>
+const M15_MS = 15 * 60_000;
+/** Events older than this are recorded but not alerted. */
+const STALE_ALERT_MS = 2 * 60 * 60_000;
+const LIVE_REFRESH_MS =
+  Math.max(0, Number(process.env.LIVE_PROGRESS_REFRESH_MINUTES ?? 15)) * 60_000;
+let lastTrackedM15 = 0;
+const lastM15Refresh = new Map<PairCode, number>();
+let candleLoopRun: Promise<void> | null = null;
+
+export function onCandleClose(now = new Date()) {
+  if (candleLoopRun) return candleLoopRun;
+  candleLoopRun = (async () => {
+    await manageOnH1Close(now).catch((error) =>
       console.warn(
-        `M15 refresh failed for ${pairCode}.`,
+        'H1 checkpoint failed.',
         error instanceof Error ? error.message : error
       )
     );
+    await trackOnM15Close(now).catch((error) =>
+      console.warn(
+        'M15 tracking failed.',
+        error instanceof Error ? error.message : error
+      )
+    );
+  })().finally(() => {
+    candleLoopRun = null;
+  });
+  return candleLoopRun;
+}
+
+async function trackOnM15Close(now: Date) {
+  if (!liveDataEnabled() || !isForexOpen(now)) return;
+  const lastClosedStart = Math.floor(now.getTime() / M15_MS) * M15_MS - M15_MS;
+  // Once per M15 close, a minute after it (the provider needs to publish it).
+  if (lastClosedStart <= lastTrackedM15) return;
+  if (now.getTime() - (lastClosedStart + M15_MS) < 60_000) return;
+  lastTrackedM15 = lastClosedStart;
+
+  const since = new Date(now.getTime() - 7 * 24 * 3_600_000);
+  const [trades, userTrades] = await Promise.all([
+    prisma.prediction.findMany({
+      where: {
+        direction: { not: 'NEUTRAL' },
+        continuesId: null,
+        validFrom: { lte: now, gte: since },
+        outcome: { is: { status: 'PENDING' } },
+      },
+      include: { outcome: true },
+    }),
+    prisma.userTrade.findMany({
+      where: {
+        exitPrice: null,
+        OR: [{ stopPrice: { not: null } }, { targetPrice: { not: null } }],
+        prediction: { validFrom: { gte: since } },
+      },
+      include: { prediction: { include: { outcome: true } } },
+    }),
+  ]);
+  if (trades.length === 0 && userTrades.length === 0) return;
+
+  // Fresh M15 for the pairs that need it (respecting the refresh interval).
+  const pairsNeeded = new Set<PairCode>([
+    ...trades.map((t) => t.pairCode as PairCode),
+    ...userTrades.map((t) => t.prediction.pairCode as PairCode),
+  ]);
+  for (const pair of pairsNeeded) {
+    if (LIVE_REFRESH_MS === 0) break;
+    if (
+      now.getTime() - (lastM15Refresh.get(pair) ?? 0) <
+      LIVE_REFRESH_MS - 30_000
+    )
+      continue;
+    lastM15Refresh.set(pair, now.getTime());
+    await fetchTimeframeCandles(pair, 'M15', lastClosedStart).catch((error) =>
+      console.warn(
+        `M15 refresh failed for ${pair}.`,
+        error instanceof Error ? error.message : error
+      )
+    );
+  }
+
+  // Closed candles only, oldest first, from the cache (no extra requests).
+  const closedSeries = async (pair: PairCode, from: Date) => {
+    for (const tf of ['M15', 'H1'] as const) {
+      const span = CANDLE_MS[tf] ?? 3_600_000;
+      const cached = await peekStale<Candle[]>(
+        `twelvedata:tf:${pair}:${tf}`
+      ).catch(() => null);
+      if (!cached?.length) continue;
+      const ordered = [...cached]
+        .filter((c) => candleTime(c) + span <= now.getTime())
+        .sort((x, y) => candleTime(x) - candleTime(y));
+      if (!ordered.length || candleTime(ordered[0]) > from.getTime()) continue;
+      return ordered.filter((c) => candleTime(c) + span > from.getTime());
+    }
+    return null;
+  };
+
+  // Engine trades: entry fills, targets and stops, announced as they happen.
+  for (const row of trades) {
+    const p = fromRow(row);
+    const candles = await closedSeries(p.pairCode, row.validFrom);
+    if (!candles) continue;
+    const path = replayPath(p, candles);
+    if (path.state === 'waiting' || path.state === 'neutral') continue;
+    // Old news (e.g. the first run after a deploy) is logged, not alerted.
+    const stale = (at: number | null) =>
+      at !== null && now.getTime() - at > STALE_ALERT_MS;
+    await announceSignalEvent(
+      'ENTRY_FILLED',
+      p,
+      {},
+      { silent: stale(path.filledAt) }
+    ).catch(() => undefined);
+    if (path.state === 'target' || path.state === 'stopped') {
+      await announceSignalEvent(
+        path.state === 'target' ? 'TARGET_HIT' : 'STOP_HIT',
+        p,
+        { pips: path.pips },
+        { silent: stale(path.closedAt) }
+      ).catch(() => undefined);
+    }
+  }
+
+  // Users' own trades: exit detected at their stop or target.
+  for (const trade of userTrades) {
+    const p = fromRow(trade.prediction);
+    const candles = await closedSeries(p.pairCode, trade.prediction.validFrom);
+    if (!candles) continue;
+    const long = trade.side === 'LONG';
+    const entry =
+      trade.entryPrice !== null
+        ? Number(trade.entryPrice)
+        : (p.entryLow + p.entryHigh) / 2;
+    const stop =
+      trade.stopPrice !== null
+        ? Number(trade.stopPrice)
+        : long
+          ? -Infinity
+          : Infinity;
+    const target =
+      trade.targetPrice !== null
+        ? Number(trade.targetPrice)
+        : long
+          ? Infinity
+          : -Infinity;
+    const path = replayPath(
+      {
+        pairCode: p.pairCode,
+        direction: trade.side,
+        entryLow: entry,
+        entryHigh: entry,
+        targetPrice: target,
+        invalidationPrice: stop,
+      },
+      candles
+    );
+    if (path.state !== 'target' && path.state !== 'stopped') continue;
+    const reason = path.state === 'target' ? 'target' : 'stop';
+    const exitPrice = reason === 'target' ? target : stop;
+    await prisma.userTrade.update({
+      where: { id: trade.id },
+      data: {
+        exitPrice,
+        exitedAt: path.closedAt ? new Date(path.closedAt) : now,
+        exitReason: reason,
+      },
+    });
+    await announceMyTradeClosed(
+      trade.userId,
+      p,
+      reason,
+      exitPrice,
+      path.pips
+    ).catch(() => undefined);
   }
 }
 const FORCED_RUN_COOLDOWN_MS = 5 * 60_000;
@@ -2052,23 +2251,12 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
       );
     }
   }
-  const openTradePairs = await evaluateExpiredPredictions(now);
-  // H1-close checkpoint: cancel broken setups, suggest exits on strong evidence.
-  await manageOnH1Close(now).catch((error) =>
-    console.warn(
-      'H1 checkpoint failed.',
-      error instanceof Error ? error.message : error
-    )
-  );
+  // The H1 checkpoint and the M15 tracker run on candle closes from the
+  // per-minute loop (onCandleClose), not here.
+  await evaluateExpiredPredictions(now);
   // Intraday signals only make sense while the market is tradeable.
   if (isForexOpen(now)) {
-    const active = await getOrCreatePredictions(now, options);
-    // One throttled refresh covers both the current signals and any earlier
-    // trades still running past their window.
-    await refreshLiveCandles(
-      new Set([...active.map((p) => p.pairCode), ...openTradePairs]),
-      now
-    );
+    await getOrCreatePredictions(now, options);
   }
   // The weekend outlook is maintained at all times so it is ready before the close.
   try {

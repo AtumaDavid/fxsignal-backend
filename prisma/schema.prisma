@@ -41,16 +41,20 @@ enum PredictionEngine {
 }
 
 model User {
-  id               Int         @id @default(autoincrement())
-  email            String      @unique
-  name             String
-  passwordHash     String
-  plan             String      @default("FREE")
-  planStatus       String      @default("ACTIVE")
-  stripeCustomerId String?
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @default(now()) @updatedAt
-  trades           UserTrade[]
+  id                Int                @id @default(autoincrement())
+  email             String             @unique
+  name              String
+  passwordHash      String
+  plan              String             @default("FREE")
+  planStatus        String             @default("ACTIVE")
+  stripeCustomerId  String?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @default(now()) @updatedAt
+  trades            UserTrade[]
+  /// Alert channels and events (see src/lib/alerts.ts for the shape/defaults).
+  alertPrefs        Json?
+  notifications     Notification[]
+  pushSubscriptions PushSubscription[]
 
   @@index([email])
 }
@@ -177,6 +181,13 @@ model UserTrade {
   entryPrice   Decimal?   @db.Decimal(16, 6)
   exitPrice    Decimal?   @db.Decimal(16, 6)
   lots         Decimal?   @db.Decimal(10, 2)
+  /// The user's own protective levels; when set, the exit is detected
+  /// automatically from the price path.
+  stopPrice    Decimal?   @db.Decimal(16, 6)
+  targetPrice  Decimal?   @db.Decimal(16, 6)
+  exitedAt     DateTime?
+  /// "stop" | "target" when detected automatically, "manual" when typed in.
+  exitReason   String?
   notes        String?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
@@ -185,4 +196,42 @@ model UserTrade {
 
   @@unique([userId, predictionId])
   @@index([userId, createdAt])
+}
+
+/// In-app notification (the bell), one row per user per alert.
+model Notification {
+  id           Int       @id @default(autoincrement())
+  userId       Int
+  kind         String
+  title        String
+  body         String
+  predictionId Int?
+  createdAt    DateTime  @default(now())
+  readAt       DateTime?
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+/// Browser push endpoint (Web Push / VAPID).
+model PushSubscription {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Each signal event is announced once (entry filled, target hit, ...).
+model SignalEvent {
+  id           Int      @id @default(autoincrement())
+  predictionId Int
+  kind         String
+  createdAt    DateTime @default(now())
+
+  @@unique([predictionId, kind])
 }

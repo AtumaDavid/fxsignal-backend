@@ -15,6 +15,8 @@ const tradeSchema = z.object({
   entryPrice: priceField,
   exitPrice: priceField,
   lots: z.coerce.number().positive().max(10_000).nullable().optional(),
+  stopPrice: priceField,
+  targetPrice: priceField,
   notes: z.string().trim().max(2000).nullable().optional(),
 });
 
@@ -24,6 +26,10 @@ type TradeRow = {
   entryPrice: unknown;
   exitPrice: unknown;
   lots: unknown;
+  stopPrice: unknown;
+  targetPrice: unknown;
+  exitedAt: Date | null;
+  exitReason: string | null;
   notes: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -55,6 +61,10 @@ function toTrade(row: TradeRow, prediction: Prediction) {
     entryPrice,
     exitPrice,
     lots: num(row.lots),
+    stopPrice: num(row.stopPrice),
+    targetPrice: num(row.targetPrice),
+    exitedAt: row.exitedAt?.toISOString() ?? null,
+    exitReason: row.exitReason,
     notes: row.notes,
     pips: tradePips(prediction.pairCode, row.side, entryPrice, exitPrice),
     createdAt: row.createdAt.toISOString(),
@@ -139,8 +149,9 @@ router.put(
       });
     }
     if (
-      !plausible(prediction, data.entryPrice) ||
-      !plausible(prediction, data.exitPrice)
+      [data.entryPrice, data.exitPrice, data.stopPrice, data.targetPrice].some(
+        (value) => !plausible(prediction, value)
+      )
     ) {
       return res.status(400).json({
         error: `Prices should be close to ${prediction.pairCode}'s level at the time — check the decimal point.`,
@@ -148,11 +159,28 @@ router.put(
     }
 
     const userId = Number(req.user?.sub);
+    const existing = await prisma.userTrade.findUnique({
+      where: { userId_predictionId: { userId, predictionId } },
+    });
+    const exitPrice = data.exitPrice ?? null;
+    const sameExit =
+      existing?.exitPrice !== null &&
+      existing?.exitPrice !== undefined &&
+      exitPrice !== null &&
+      Number(existing.exitPrice) === exitPrice;
     const fields = {
       side,
       entryPrice: data.entryPrice ?? null,
-      exitPrice: data.exitPrice ?? null,
+      exitPrice,
       lots: data.lots ?? null,
+      stopPrice: data.stopPrice ?? null,
+      targetPrice: data.targetPrice ?? null,
+      // Keep an automatically detected exit's reason/time when it is
+      // unchanged; a typed exit is "manual"; no exit clears both.
+      exitReason:
+        exitPrice === null ? null : sameExit ? existing!.exitReason : 'manual',
+      exitedAt:
+        exitPrice === null ? null : sameExit ? existing!.exitedAt : new Date(),
       notes: data.notes || null,
     };
     const trade = await prisma.userTrade.upsert({
