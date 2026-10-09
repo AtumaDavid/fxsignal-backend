@@ -143,6 +143,12 @@ chmod 400 ~/.ssh/fxsignal.pem
 ssh -i ~/.ssh/fxsignal.pem ec2-user@fxsignal.duckdns.org
 ```
 
+On my laptop the key is in Downloads, so I connect with:
+
+```bash
+ssh -i /home/atuma-david/Downloads/fxsignal.pem ec2-user@fxsignal.duckdns.org
+```
+
 Use `ec2-user@<public-ip>` if the domain does not resolve from your machine. The username is `ec2-user` on Amazon Linux (`ubuntu` only on Ubuntu AMIs). A prompt like `[ec2-user@ip-172-31-33-92 ~]$` means you are in.
 
 Optional shortcut: add this to `~/.ssh/config` on your laptop, then connect with `ssh fxsignal`.
@@ -529,7 +535,7 @@ An Elastic IP is optional. Without one, the public IP stays the same through reb
 
 | Task | Command |
 | --- | --- |
-| SSH in (laptop) | `ssh -i ~/.ssh/fxsignal.pem ec2-user@fxsignal.duckdns.org` |
+| SSH in (laptop) | `ssh -i /home/atuma-david/Downloads/fxsignal.pem ec2-user@fxsignal.duckdns.org` |
 | Deploy latest code (server) | `~/deploy.sh` |
 | Push a schema change (server) | `DATABASE_URL='<direct Neon URL>' npx prisma db push` |
 | App status | `pm2 status` |
