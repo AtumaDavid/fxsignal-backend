@@ -1268,6 +1268,8 @@ export function decideOnH1Close(input: {
   return { action: 'none', reason: '' };
 }
 
+/** Last H1 close fully processed for every pair (gates the per-minute loop). */
+let lastH1Pass = 0;
 /** Last closed H1 candle processed per pair, so each candle is checked once. */
 const lastManagedH1 = new Map<PairCode, number>();
 const H1_MS = 60 * 60_000;
@@ -1281,6 +1283,13 @@ const H1_PUBLISH_DELAY_MS = 2 * 60_000;
  */
 export async function manageOnH1Close(now = new Date()) {
   if (!liveDataEnabled() || !isForexOpen(now)) return;
+  // Cheap timing gate first: nothing to do until a new H1 candle has closed
+  // (and had a moment to publish), so the per-minute loop costs no queries.
+  const hourStart = Math.floor(now.getTime() / H1_MS) * H1_MS;
+  const lastClosedStart = hourStart - H1_MS;
+  if (now.getTime() - hourStart < H1_PUBLISH_DELAY_MS) return;
+  if (lastClosedStart <= lastH1Pass) return;
+
   const rows = await prisma.prediction.findMany({
     where: {
       direction: { not: 'NEUTRAL' },
@@ -1290,12 +1299,13 @@ export async function manageOnH1Close(now = new Date()) {
     },
     include: { outcome: true },
   });
-  if (rows.length === 0) return;
+  if (rows.length === 0) {
+    lastH1Pass = lastClosedStart;
+    return;
+  }
 
-  const hourStart = Math.floor(now.getTime() / H1_MS) * H1_MS;
-  const lastClosedStart = hourStart - H1_MS;
-  if (now.getTime() - hourStart < H1_PUBLISH_DELAY_MS) return;
-
+  // A pair whose candle isn't published yet is retried next minute.
+  let deferred = false;
   for (const pair of new Set(rows.map((r) => r.pairCode as PairCode))) {
     if ((lastManagedH1.get(pair) ?? 0) >= lastClosedStart) continue;
     let h1: Candle[];
@@ -1310,6 +1320,7 @@ export async function manageOnH1Close(now = new Date()) {
         `H1 checkpoint skipped for ${pair}.`,
         error instanceof Error ? error.message : error
       );
+      deferred = true;
       continue;
     }
     // Only fully closed H1 candles (the provider also returns the live one).
@@ -1317,7 +1328,10 @@ export async function manageOnH1Close(now = new Date()) {
       .filter((c) => candleTime(c) + H1_MS <= now.getTime())
       .sort((a, b) => candleTime(a) - candleTime(b));
     const last = closed[closed.length - 1];
-    if (!last || candleTime(last) < lastClosedStart) continue; // not published yet
+    if (!last || candleTime(last) < lastClosedStart) {
+      deferred = true; // not published yet
+      continue;
+    }
     lastManagedH1.set(pair, lastClosedStart);
 
     // Same indicators the engine uses; analyzeTimeframe expects newest-first.
@@ -1392,6 +1406,7 @@ export async function manageOnH1Close(now = new Date()) {
       }
     }
   }
+  if (!deferred) lastH1Pass = lastClosedStart;
 }
 
 /**
