@@ -5,8 +5,14 @@ import { adminEmails } from '../lib/admin.js';
 import { emailConfigured, pushConfigured } from '../lib/alerts.js';
 import { aiAnalysisEnabled, liveDataEnabled } from '../lib/liveData.js';
 import { cachedSeriesStatus, creditUsage } from '../lib/rateCache.js';
-import { getOpsStatus } from '../lib/predictions.js';
-import { PAIRS } from '../lib/market.js';
+import {
+  fromRow,
+  getOpsStatus,
+  maintainMarketData,
+  onCandleClose,
+} from '../lib/predictions.js';
+import { PAIRS, pipSize } from '../lib/market.js';
+import type { PairCode } from '../lib/model.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
 import { backtestRunning, startBacktest } from '../lib/backtest.js';
 
@@ -158,15 +164,19 @@ router.get(
   '/users',
   asyncRoute(async (req, res) => {
     const q = String(req.query.q ?? '').trim();
+    const plan = String(req.query.plan ?? 'ALL').toUpperCase();
     const rows = await prisma.user.findMany({
-      where: q
-        ? {
-            OR: [
-              { email: { contains: q, mode: 'insensitive' } },
-              { name: { contains: q, mode: 'insensitive' } },
-            ],
-          }
-        : {},
+      where: {
+        ...(q
+          ? {
+              OR: [
+                { email: { contains: q, mode: 'insensitive' } },
+                { name: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
+        ...(plan === 'FREE' || plan === 'PRO' ? { plan } : {}),
+      },
       orderBy: { createdAt: 'desc' },
       take: 200,
       select: {
@@ -177,7 +187,9 @@ router.get(
         planStatus: true,
         createdAt: true,
         lastSeenAt: true,
-        _count: { select: { trades: true, pushSubscriptions: true } },
+        _count: {
+          select: { trades: true, pushSubscriptions: true, notifications: true },
+        },
       },
     });
     res.json({
@@ -185,8 +197,133 @@ router.get(
         ...u,
         trades: _count.trades,
         pushDevices: _count.pushSubscriptions,
+        notifications: _count.notifications,
       })),
     });
+  })
+);
+
+/** One user's full record: profile, devices, recent trades and notifications. */
+router.get(
+  '/users/:id',
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id))
+      return res.status(400).json({ error: 'Unknown user.' });
+    const user = await prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        plan: true,
+        planStatus: true,
+        createdAt: true,
+        lastSeenAt: true,
+        pushSubscriptions: {
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          select: { id: true, createdAt: true },
+        },
+      },
+    });
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    const [tradeRows, notifications, counts] = await Promise.all([
+      prisma.userTrade.findMany({
+        where: { userId: id },
+        include: { prediction: { include: { outcome: true } } },
+        orderBy: { updatedAt: 'desc' },
+        take: 10,
+      }),
+      prisma.notification.findMany({
+        where: { userId: id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+        select: {
+          id: true,
+          kind: true,
+          title: true,
+          createdAt: true,
+          readAt: true,
+        },
+      }),
+      prisma.notification.count({ where: { userId: id, readAt: null } }),
+    ]);
+    res.json({
+      user: {
+        ...user,
+        unreadNotifications: counts,
+        pushDevices: user.pushSubscriptions.map((s) => ({
+          id: s.id,
+          createdAt: s.createdAt.toISOString(),
+        })),
+      },
+      trades: tradeRows.map((row) => {
+        const prediction = fromRow(row.prediction);
+        const entry =
+          row.entryPrice === null ? null : Number(row.entryPrice);
+        const exit = row.exitPrice === null ? null : Number(row.exitPrice);
+        const pips =
+          entry === null || exit === null
+            ? null
+            : Number(
+                (
+                  ((row.side === 'SHORT' ? entry - exit : exit - entry) /
+                    pipSize(prediction.pairCode as PairCode)) as number
+                ).toFixed(1)
+              );
+        return {
+          id: String(row.id),
+          pairCode: prediction.pairCode,
+          side: row.side,
+          entryPrice: entry,
+          exitPrice: exit,
+          lots:
+            row.lots === null || row.lots === undefined
+              ? null
+              : Number(row.lots),
+          exitReason: row.exitReason,
+          pips,
+          status: row.prediction.outcome?.status ?? 'PENDING',
+          updatedAt: row.updatedAt.toISOString(),
+        };
+      }),
+      notifications: notifications.map((n) => ({
+        ...n,
+        createdAt: n.createdAt.toISOString(),
+        read: n.readAt !== null,
+      })),
+    });
+  })
+);
+
+/** Permanently delete a user and everything attached to them. */
+router.delete(
+  '/users/:id',
+  asyncRoute(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id))
+      return res.status(400).json({ error: 'Unknown user.' });
+    if (id === Number(req.user?.sub))
+      return res
+        .status(400)
+        .json({ error: 'You cannot delete your own admin account.' });
+    const existing = await prisma.user.findUnique({
+      where: { id },
+      select: { id: true, email: true },
+    });
+    if (!existing)
+      return res.status(404).json({ error: 'User not found.' });
+    // Children first so the delete works with or without DB cascades.
+    await prisma.$transaction([
+      prisma.userTrade.deleteMany({ where: { userId: id } }),
+      prisma.notification.deleteMany({ where: { userId: id } }),
+      prisma.pushSubscription.deleteMany({ where: { userId: id } }),
+      prisma.mt5Link.deleteMany({ where: { userId: id } }),
+      prisma.user.delete({ where: { id } }),
+    ]);
+    console.info(`Admin ${req.user?.sub} deleted user ${existing.email}`);
+    res.status(204).end();
   })
 );
 
@@ -206,6 +343,110 @@ router.patch(
       select: { id: true, plan: true },
     });
     res.json({ user });
+  })
+);
+
+// ---- Announcements -------------------------------------------------------------
+
+/** Send an in-app announcement to the bell of every user (or one plan). */
+const broadcastSchema = z.object({
+  title: z.string().trim().min(3).max(80),
+  body: z.string().trim().min(3).max(280),
+  audience: z.enum(['ALL', 'FREE', 'PRO']).default('ALL'),
+});
+
+router.post(
+  '/broadcast',
+  asyncRoute(async (req, res) => {
+    const parsed = broadcastSchema.safeParse(req.body ?? {});
+    if (!parsed.success)
+      return res
+        .status(400)
+        .json({ error: 'Title (3–80) and body (3–280 chars) required.' });
+    const { title, body, audience } = parsed.data;
+    const targets = await prisma.user.findMany({
+      where: audience === 'ALL' ? {} : { plan: audience },
+      select: { id: true },
+    });
+    if (targets.length === 0)
+      return res.status(400).json({ error: 'No users in that audience.' });
+    const sent = await prisma.notification.createMany({
+      data: targets.map((t) => ({
+        userId: t.id,
+        kind: 'ADMIN_ANNOUNCE',
+        title,
+        body,
+      })),
+    });
+    console.info(
+      `Admin ${req.user?.sub} broadcast "${title}" to ${sent.count} users (${audience})`
+    );
+    res.json({ sent: sent.count, audience });
+  })
+);
+
+// ---- Operations ----------------------------------------------------------------
+
+/** Run the market-data maintenance pass now (forced, bypasses cooldowns once). */
+router.post(
+  '/maintenance',
+  asyncRoute(async (_req, res) => {
+    await maintainMarketData(new Date(), { force: true });
+    res.json({ jobs: getOpsStatus() });
+  })
+);
+
+/** Run the candle-close loop now (H1 checkpoint + M15 tracking + auto-exits). */
+router.post(
+  '/candle-loop',
+  asyncRoute(async (_req, res) => {
+    await onCandleClose(new Date());
+    res.json({ jobs: getOpsStatus() });
+  })
+);
+
+/** Latest published signals with their settlement state. */
+router.get(
+  '/signals',
+  asyncRoute(async (req, res) => {
+    const take = Math.min(
+      50,
+      Math.max(1, Number(req.query.take ?? 20) || 20)
+    );
+    const rows = await prisma.prediction.findMany({
+      orderBy: { validFrom: 'desc' },
+      take,
+      include: { outcome: true },
+    });
+    res.json({
+      signals: rows.map((row) => {
+        const p = fromRow(row);
+        return {
+          id: p.id,
+          pairCode: p.pairCode,
+          direction: p.direction,
+          session: p.session,
+          confidence: p.confidence,
+          validFrom: p.validFrom,
+          status: row.outcome?.status ?? 'PENDING',
+          movementPips:
+            row.outcome?.movementPips === null ||
+            row.outcome?.movementPips === undefined
+              ? null
+              : Number(row.outcome.movementPips),
+        };
+      }),
+    });
+  })
+);
+
+/** Clear the failed-delivery log (kept for diagnosis, safe to empty). */
+router.delete(
+  '/alert-failures',
+  asyncRoute(async (req, res) => {
+    const { count } = await prisma.alertFailure.deleteMany({});
+    console.info(`Admin ${req.user?.sub} cleared ${count} alert failures`);
+    res.json({ cleared: count });
   })
 );
 

@@ -394,17 +394,23 @@ export async function announceSignalEvent(
   await fanOut({ kind, title, body, predictionId, path: '/app/signals' });
 }
 
-/** A user's own journal trade was closed automatically at their stop or target. */
+/** A user's own journal trade was closed automatically: target, stop or breakeven scratch. */
 export async function announceMyTradeClosed(
   userId: number,
   p: Prediction,
-  reason: 'stop' | 'target',
+  reason: 'stop' | 'target' | 'breakeven',
   exitPrice: number,
   resultPips: number | null
 ) {
+  const outcome =
+    reason === 'target'
+      ? 'hit its target'
+      : reason === 'breakeven'
+        ? 'closed at breakeven'
+        : 'was stopped out';
   const title =
-    `Your ${p.pairCode} ${side(p)} ${reason === 'target' ? 'hit its target' : 'was stopped out'} ${pips(resultPips)}`.trim();
-  const body = `Exit recorded in your journal at ${px(p, exitPrice)} (your ${reason}).`;
+    `Your ${p.pairCode} ${side(p)} ${outcome} ${pips(resultPips)}`.trim();
+  const body = `Exit recorded in your journal at ${px(p, exitPrice)} (${reason === 'breakeven' ? 'breakeven scratch, no gain no loss' : `your ${reason}`}).`;
   await fanOut(
     {
       kind: 'MY_TRADE_CLOSED',

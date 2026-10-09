@@ -18,6 +18,10 @@ const tradeSchema = z.object({
   stopPrice: priceField,
   targetPrice: priceField,
   notes: z.string().trim().max(2000).nullable().optional(),
+  // Explicit close kind. 'breakeven' records exit = entry (0 pips) so
+  // scratch trades are traced as breakevens, not wins/losses. When omitted,
+  // an exit typed exactly at the entry is still detected as breakeven.
+  exitReason: z.enum(['manual', 'breakeven']).nullable().optional(),
 });
 
 type TradeRow = {
@@ -144,6 +148,7 @@ router.get(
         open: trades.length - closed.length,
         wins: closed.filter((t) => (t.pips ?? 0) > 0).length,
         losses: closed.filter((t) => (t.pips ?? 0) < 0).length,
+        breakevens: closed.filter((t) => (t.pips ?? 0) === 0).length,
         netPips: sum(closed.map((t) => t.pips ?? 0)),
         engineNetPips: sum(
           engineScored.map((t) => t.prediction.outcome?.movementPips ?? 0)
@@ -200,23 +205,48 @@ router.put(
     const existing = await prisma.userTrade.findUnique({
       where: { userId_predictionId: { userId, predictionId } },
     });
-    const exitPrice = data.exitPrice ?? null;
+    const entryPrice = data.entryPrice ?? null;
+    // An explicit breakeven close is recorded at the entry (0 pips), even if
+    // no exit price was typed.
+    const exitPrice =
+      data.exitReason === 'breakeven' ? (data.exitPrice ?? entryPrice) : (data.exitPrice ?? null);
+    if (data.exitReason === 'breakeven' && exitPrice === null) {
+      return res.status(400).json({
+        error: 'Set an entry price first — breakeven closes at the entry.',
+      });
+    }
     const sameExit =
       existing?.exitPrice !== null &&
       existing?.exitPrice !== undefined &&
       exitPrice !== null &&
       Number(existing.exitPrice) === exitPrice;
+    // An exit typed exactly at the entry is a breakeven scratch, whether the
+    // client said so or not.
+    const isBreakeven =
+      data.exitReason === 'breakeven' ||
+      (exitPrice !== null &&
+        entryPrice !== null &&
+        exitPrice === entryPrice);
     const fields = {
       side,
-      entryPrice: data.entryPrice ?? null,
+      entryPrice,
       exitPrice,
       lots: data.lots ?? null,
       stopPrice: data.stopPrice ?? null,
       targetPrice: data.targetPrice ?? null,
       // Keep an automatically detected exit's reason/time when it is
-      // unchanged; a typed exit is "manual"; no exit clears both.
+      // unchanged; otherwise a breakeven stays 'breakeven' and any other
+      // typed exit is "manual"; no exit clears both.
       exitReason:
-        exitPrice === null ? null : sameExit ? existing!.exitReason : 'manual',
+        exitPrice === null
+          ? null
+          : sameExit
+            ? (existing!.exitReason === 'breakeven' || isBreakeven
+                ? 'breakeven'
+                : existing!.exitReason)
+            : isBreakeven
+              ? 'breakeven'
+              : 'manual',
       exitedAt:
         exitPrice === null ? null : sameExit ? existing!.exitedAt : new Date(),
       notes: data.notes || null,

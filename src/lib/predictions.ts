@@ -2499,7 +2499,17 @@ async function trackOnM15Close(now: Date) {
       candles
     );
     if (path.state !== 'target' && path.state !== 'stopped') continue;
-    const reason = path.state === 'target' ? 'target' : 'stop';
+    let reason: 'target' | 'stop' | 'breakeven' =
+      path.state === 'target' ? 'target' : 'stop';
+    // A stop sitting exactly at the entry is a breakeven scratch, not a loss:
+    // trace it as breakeven so the journal tells the real story.
+    if (
+      reason === 'stop' &&
+      Number.isFinite(stop) &&
+      Math.abs(stop - entry) < entry * 1e-9
+    ) {
+      reason = 'breakeven';
+    }
     const exitPrice = reason === 'target' ? target : stop;
     await prisma.userTrade.update({
       where: { id: trade.id },
@@ -2545,6 +2555,19 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
   } catch (error) {
     console.warn(
       'Weekly outlook maintenance failed.',
+      error instanceof Error ? error.message : error
+    );
+  }
+  // Housekeeping: drop notifications older than the retention window so the
+  // bell never grows without bound (users can also delete manually).
+  try {
+    const cutoff = new Date(now.getTime() - 30 * 86_400_000);
+    await prisma.notification.deleteMany({
+      where: { createdAt: { lt: cutoff } },
+    });
+  } catch (error) {
+    console.warn(
+      'Notification prune failed.',
       error instanceof Error ? error.message : error
     );
   }

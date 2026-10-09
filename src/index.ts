@@ -97,7 +97,11 @@ app.use('/api/journal', requireAuth, journalRoutes);
 app.use('/api/notifications', requireAuth, notificationsRoutes);
 app.use('/api/recap', requireAuth, recapRoutes);
 app.use('/api/risk', requireAuth, riskRoutes);
-app.use('/api/admin', requireAuth, requireAdmin, adminRoutes);
+// Owner console: authenticated + ADMIN_EMAILS allowlist, with its own abuse
+// budget. The admin UI lives on a separate /admin surface (optionally a
+// separate domain via VITE_ADMIN_ONLY=1); this middleware is the real gate.
+const adminLimit = rateLimit(120, 60_000);
+app.use('/api/admin', adminLimit, requireAuth, requireAdmin, adminRoutes);
 app.use('/api/mt5/sync', rateLimit(30, 60_000), mt5SyncRouter);
 app.use('/api/mt5', requireAuth, mt5Router);
 // Unauthenticated, so it gets its own per-IP budget.
@@ -136,6 +140,11 @@ app.use(
 const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
 
 async function start() {
+  if (!process.env.ADMIN_EMAILS) {
+    console.warn(
+      'ADMIN_EMAILS is not set; the /api/admin console will reject everyone until an owner email is configured.'
+    );
+  }
   try {
     await bootstrapDatabase();
     console.log('Postgres connected and schema verified.');
