@@ -29,6 +29,9 @@ export async function bootstrapDatabase() {
     'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "continuesId" INTEGER',
     `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CANCELLED'`,
     `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'CLOSED_EARLY'`,
+    // TP1 / TP2 + breakeven management.
+    `ALTER TYPE "OutcomeStatus" ADD VALUE IF NOT EXISTS 'BREAKEVEN'`,
+    'ALTER TABLE "Prediction" ADD COLUMN IF NOT EXISTS "target2Price" DECIMAL(16,6)',
     // Alerts + automatic journal exits. Same DDL `prisma db push` generates.
     'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "alertPrefs" JSONB',
     'ALTER TABLE "UserTrade" ADD COLUMN IF NOT EXISTS "stopPrice" DECIMAL(16,6)',

@@ -80,6 +80,40 @@ function plausible(prediction: Prediction, value: number | null | undefined) {
   return Math.abs(value - mid) / mid < 0.1;
 }
 
+type Trade = ReturnType<typeof toTrade>;
+
+/**
+ * The user's closed trades grouped (by pair, by session), best net pips
+ * first, so the journal can show where they trade best.
+ */
+function breakdown(closed: Trade[], keyOf: (t: Trade) => string) {
+  const groups = new Map<string, Trade[]>();
+  for (const trade of closed) {
+    const key = keyOf(trade);
+    groups.set(key, [...(groups.get(key) ?? []), trade]);
+  }
+  return [...groups.entries()]
+    .map(([key, trades]) => {
+      const pips = trades.map((t) => t.pips ?? 0);
+      const wins = pips.filter((p) => p > 0).length;
+      const losses = pips.filter((p) => p < 0).length;
+      const net = pips.reduce((a, b) => a + b, 0);
+      return {
+        key,
+        trades: trades.length,
+        wins,
+        losses,
+        winRate:
+          wins + losses > 0
+            ? Number(((wins / (wins + losses)) * 100).toFixed(1))
+            : null,
+        netPips: Number(net.toFixed(1)),
+        avgPips: Number((net / trades.length).toFixed(1)),
+      };
+    })
+    .sort((a, b) => b.netPips - a.netPips);
+}
+
 router.get(
   '/',
   asyncRoute(async (req, res) => {
@@ -96,7 +130,7 @@ router.get(
     const sum = (values: number[]) =>
       Number(values.reduce((a, b) => a + b, 0).toFixed(1));
     const engineScored = trades.filter((t) =>
-      ['HIT', 'MISSED', 'CLOSED_EARLY'].includes(
+      ['HIT', 'MISSED', 'CLOSED_EARLY', 'BREAKEVEN'].includes(
         t.prediction.outcome?.status ?? ''
       )
     );
@@ -114,6 +148,8 @@ router.get(
         ),
         engineScored: engineScored.length,
       },
+      byPair: breakdown(closed, (t) => t.prediction.pairCode),
+      bySession: breakdown(closed, (t) => t.prediction.session),
     });
   })
 );

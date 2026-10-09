@@ -22,6 +22,8 @@ enum OutcomeStatus {
   CANCELLED
   /// Exited before target or stop on strong H1 evidence against the trade.
   CLOSED_EARLY
+  /// Reached +1R, stop moved to entry, then closed there (0 pips).
+  BREAKEVEN
 }
 
 enum OutcomeSource {
@@ -81,6 +83,9 @@ model Prediction {
   entryLow          Decimal            @db.Decimal(16, 6)
   entryHigh         Decimal            @db.Decimal(16, 6)
   targetPrice       Decimal            @db.Decimal(16, 6)
+  /// Second target (runner). Set on managed trades: half off at TP1
+  /// (targetPrice), stop to entry at +1R, the rest runs to TP2.
+  target2Price      Decimal?           @db.Decimal(16, 6)
   invalidationPrice Decimal            @db.Decimal(16, 6)
   rationale         String
   factors           Json

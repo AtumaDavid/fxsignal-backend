@@ -16,8 +16,11 @@ import type { Prediction } from './model.js';
 export type AlertKind =
   | 'SIGNAL_NEW'
   | 'ENTRY_FILLED'
+  | 'BREAKEVEN_SET'
+  | 'TP1_HIT'
   | 'TARGET_HIT'
   | 'STOP_HIT'
+  | 'BREAKEVEN_HIT'
   | 'CANCELLED'
   | 'CLOSED_EARLY'
   | 'MY_TRADE_CLOSED';
@@ -29,8 +32,12 @@ export type AlertGroup =
 const GROUP_OF: Record<AlertKind, AlertGroup> = {
   SIGNAL_NEW: 'newSignal',
   ENTRY_FILLED: 'entry',
+  // Trade management steps ride with the entry alerts: same "act now" moment.
+  BREAKEVEN_SET: 'entry',
+  TP1_HIT: 'entry',
   TARGET_HIT: 'result',
   STOP_HIT: 'result',
+  BREAKEVEN_HIT: 'result',
   CANCELLED: 'checkpoint',
   CLOSED_EARLY: 'checkpoint',
   MY_TRADE_CLOSED: 'myTrades',
@@ -258,6 +265,12 @@ function noteBody(note: string | null | undefined) {
   );
 }
 
+function targets(p: Prediction) {
+  return p.target2Price
+    ? `TP1 ${px(p, p.targetPrice)} (${p.riskReward ?? '—'}R), TP2 ${px(p, p.target2Price)}`
+    : `target ${px(p, p.targetPrice)} (${p.riskReward ?? '—'}R)`;
+}
+
 function compose(
   kind: AlertKind,
   p: Prediction,
@@ -268,22 +281,41 @@ function compose(
     case 'SIGNAL_NEW':
       return {
         title: `New ${p.session} signal: ${name}`,
-        body: `Entry ${px(p, p.entryLow)}–${px(p, p.entryHigh)}, stop ${px(p, p.invalidationPrice)}, target ${px(p, p.targetPrice)} (${p.riskReward ?? '—'}R). Wait for an M15 close in the trade direction before entering.`,
+        body: `Entry ${px(p, p.entryLow)}–${px(p, p.entryHigh)}, stop ${px(p, p.invalidationPrice)}, ${targets(p)}. Wait for an M15 close in the trade direction before entering.`,
       };
     case 'ENTRY_FILLED':
       return {
         title: `Entry triggered: ${name}`,
-        body: `Price traded into the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Stop ${px(p, p.invalidationPrice)}, target ${px(p, p.targetPrice)}.`,
+        body: `Price traded into the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Stop ${px(p, p.invalidationPrice)}, ${targets(p)}.`,
+      };
+    case 'BREAKEVEN_SET':
+      return {
+        title: `Move stop to entry: ${name}`,
+        body: `${p.pairCode} is +1R. Move the stop to your entry (${px(p, (p.entryLow + p.entryHigh) / 2)}) so this trade can no longer lose.`,
+      };
+    case 'TP1_HIT':
+      return {
+        title: `TP1 hit: ${name}`,
+        body: `${p.pairCode} reached TP1 ${px(p, p.targetPrice)}. Take half off and keep the stop at entry; the rest runs to TP2 ${px(p, p.target2Price)}.`,
       };
     case 'TARGET_HIT':
       return {
-        title: `Target hit: ${name} ${pips(extra.pips)}`.trim(),
-        body: `${p.pairCode} reached the target ${px(p, p.targetPrice)}.`,
+        title:
+          `${p.target2Price ? 'Trade closed in profit' : 'Target hit'}: ${name} ${pips(extra.pips)}`.trim(),
+        body:
+          extra.note && p.target2Price
+            ? `${p.pairCode}: ${extra.note}`
+            : `${p.pairCode} reached the target ${px(p, p.targetPrice)}.`,
       };
     case 'STOP_HIT':
       return {
         title: `Stopped out: ${name} ${pips(extra.pips)}`.trim(),
         body: `${p.pairCode} traded through the invalidation level ${px(p, p.invalidationPrice)}.`,
+      };
+    case 'BREAKEVEN_HIT':
+      return {
+        title: `Closed at breakeven: ${name}`,
+        body: `${p.pairCode} came back to the entry after +1R. Closed for 0 — no loss.`,
       };
     case 'CANCELLED':
       return {

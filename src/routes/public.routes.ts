@@ -47,6 +47,7 @@ router.get('/track-record', async (req, res) => {
         entryLow: row.entryLow,
         entryHigh: row.entryHigh,
         targetPrice: row.targetPrice,
+        target2Price: row.target2Price,
         invalidationPrice: row.invalidationPrice,
         status: row.outcome?.status ?? 'PENDING',
         movementPips: row.outcome?.movementPips ?? null,

@@ -3,7 +3,13 @@ export type PairCode = 'EUR/USD' | 'USD/JPY';
 export type Direction = 'LONG' | 'SHORT' | 'NEUTRAL';
 export type Impact = 'LOW' | 'MEDIUM' | 'HIGH';
 export type OutcomeStatus =
-  'PENDING' | 'HIT' | 'MISSED' | 'EXPIRED' | 'CANCELLED' | 'CLOSED_EARLY';
+  | 'PENDING'
+  | 'HIT'
+  | 'MISSED'
+  | 'EXPIRED'
+  | 'CANCELLED'
+  | 'CLOSED_EARLY'
+  | 'BREAKEVEN';
 export type OutcomeSource = 'LIVE' | 'DEMO';
 export type PredictionEngine = 'RULE_BASED' | 'DEEPSEEK';
 
@@ -24,13 +30,28 @@ export interface TimeframeVote {
 
 /** Where an open signal stands right now, replayed from the newest M15 candles. */
 export interface LiveProgress {
-  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped';
+  /**
+   * target: won (TP2, or TP1 then the rest at entry) · stopped: full stop ·
+   * breakeven: +1R reached, then closed at entry for 0.
+   */
+  state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped' | 'breakeven';
   filledAt: string | null;
   closedAt: string | null;
-  /** Signed pips from the zone midpoint (exit price once decided). */
+  /**
+   * Signed pips for the whole position from the zone midpoint (exit once
+   * decided). With TP1/TP2 it blends the half booked at TP1 with the rest.
+   */
   pips: number | null;
-  /** −100 (at the stop) … +100 (at the target). */
+  /** −100 (at the stop) … +100 (at the final target). */
   progress: number | null;
+  /** When +1R traded and the stop moved to entry. */
+  breakevenAt: string | null;
+  /** When TP1 traded and half was booked. */
+  tp1At: string | null;
+  /** The runner reached TP2. */
+  tp2Hit: boolean;
+  /** Where the stop is now (the entry once breakeven is on). */
+  stopNow: number | null;
   lastPrice: number | null;
   /** End of the newest candle the replay used. */
   asOf: string | null;
@@ -47,6 +68,8 @@ export interface Prediction {
   entryLow: number;
   entryHigh: number;
   targetPrice: number;
+  /** TP2 (runner). Null on older single-target signals and stand-asides. */
+  target2Price: number | null;
   invalidationPrice: number;
   rationale: string;
   factors: string[];

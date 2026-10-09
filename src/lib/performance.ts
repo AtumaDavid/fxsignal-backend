@@ -20,6 +20,8 @@ export interface PerformanceSummary {
     closedEarly: number;
     /** Withdrawn before entry; never a trade. */
     cancelled: number;
+    /** +1R reached, then closed at entry for 0 (a trade, not a win or loss). */
+    breakeven: number;
   };
   byPair: Bucket[];
   bySession: Bucket[];
@@ -55,6 +57,7 @@ function finalize(bucket: Bucket, confidenceSum: number): Bucket {
 
 /**
  * Track record from settled signals. Only HIT and MISSED count as scored —
+ * breakevens and early exits add to net pips but not to the hit rate;
  * neutral calls, untriggered entries and pending rows are reported separately
  * so they never inflate (or deflate) the hit rate.
  */
@@ -77,6 +80,7 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
   let neutral = 0;
   let closedEarly = 0;
   let cancelled = 0;
+  let breakeven = 0;
   const scoredRows: Prediction[] = [];
 
   for (const row of rows) {
@@ -87,8 +91,9 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
       `session:${row.session}`,
     ];
     const isScored = status === 'HIT' || status === 'MISSED';
-    // Early exits are real P&L (net pips, curve) but not a target/stop result.
-    const isEarly = status === 'CLOSED_EARLY';
+    // Early exits and breakevens are real trades (net pips, curve) but
+    // neither a win nor a loss, so they stay out of the hit rate.
+    const isEarly = status === 'CLOSED_EARLY' || status === 'BREAKEVEN';
     for (const key of keys) {
       const entry = group(key);
       entry.bucket.signals += 1;
@@ -102,7 +107,8 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
         entry.bucket.netPips += row.outcome?.movementPips ?? 0;
     }
     if (isScored || isEarly) scoredRows.push(row);
-    if (isEarly) closedEarly += 1;
+    if (status === 'BREAKEVEN') breakeven += 1;
+    else if (isEarly) closedEarly += 1;
     else if (status === 'CANCELLED') cancelled += 1;
     else if (status === 'PENDING') pending += 1;
     else if (!isScored && row.direction === 'NEUTRAL') neutral += 1;
@@ -143,6 +149,7 @@ export function buildPerformance(rows: Prediction[]): PerformanceSummary {
       neutral,
       closedEarly,
       cancelled,
+      breakeven,
     },
     byPair: pick('pair'),
     bySession: pick('session'),
