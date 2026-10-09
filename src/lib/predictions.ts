@@ -220,6 +220,8 @@ async function activePrediction(pairCode: PairCode, now: Date) {
   return prisma.prediction.findFirst({
     where: {
       pairCode,
+      // Legacy "hold" rows are not signals of their own.
+      continuesId: null,
       validFrom: { lte: now },
       expiresAt: { gt: now },
     },
@@ -1126,55 +1128,35 @@ function utcClock(iso: string) {
   return `${new Date(iso).toISOString().slice(11, 16)} UTC`;
 }
 
+export type OpenTradeDecision =
+  | { action: 'publish'; signal: Prediction }
+  | { action: 'carry'; prior: Prediction; reconfirmed: boolean };
+
 /**
- * How a new window's call relates to a trade on the same pair that is still
+ * How a new window's read relates to a trade on the same pair that is still
  * running from an earlier window:
- * - same direction → a "hold": no second entry (it would double the risk and
- *   double-count one move); the card shows the open trade's levels and says
- *   to manage it. Holds are not scored separately.
- * - opposite direction → published as normal, with a warning to close or
- *   reduce the open trade first.
- * - neutral → published as normal, noting the open trade keeps its levels.
+ * - same direction → carry: the original trade stays the pair's signal
+ *   ("still valid"), nothing new is published or counted;
+ * - neutral → carry as well, marked not re-confirmed (manage it on its own
+ *   levels) — a stand-aside next to an open trade only confuses;
+ * - opposite direction → a new signal is published, with a warning to close
+ *   or reduce the open trade first.
  */
-export function withOpenTradeRules(
+export function openTradeDecision(
   signal: Prediction,
   open: Prediction[]
-): Prediction {
+): OpenTradeDecision {
   const prior = open.find((t) => t.pairCode === signal.pairCode);
-  if (!prior) return signal;
+  if (!prior) return { action: 'publish', signal };
+  if (signal.direction === prior.direction)
+    return { action: 'carry', prior, reconfirmed: true };
+  if (signal.direction === 'NEUTRAL')
+    return { action: 'carry', prior, reconfirmed: false };
   const side = prior.direction === 'LONG' ? 'long' : 'short';
   const opened = utcClock(prior.validFrom);
-  const running =
-    prior.live?.pips !== null && prior.live?.pips !== undefined
-      ? ` (${prior.live.pips > 0 ? '+' : ''}${prior.live.pips}p)`
-      : '';
-
-  if (signal.direction === prior.direction) {
-    return {
-      ...signal,
-      direction: 'NEUTRAL',
-      continuesId: prior.id,
-      entryLow: prior.entryLow,
-      entryHigh: prior.entryHigh,
-      targetPrice: prior.targetPrice,
-      invalidationPrice: prior.invalidationPrice,
-      stopPips: prior.stopPips,
-      targetPips: prior.targetPips,
-      riskReward: prior.riskReward,
-      rationale:
-        `Hold. The ${opened} ${side} on ${signal.pairCode} is still open${running}, and this window's read points the same way, so there is no second entry. ${signal.rationale}`.slice(
-          0,
-          600
-        ),
-      factors: [`Managing the open ${opened} ${side}`, ...signal.factors].slice(
-        0,
-        5
-      ),
-      playbook: `Hold the ${opened} ${side}: keep the stop at ${prior.invalidationPrice} and the target at ${prior.targetPrice}. No new entry this window.`,
-    };
-  }
-  if (signal.direction !== 'NEUTRAL') {
-    return {
+  return {
+    action: 'publish',
+    signal: {
       ...signal,
       factors: [
         `Conflicts with the open ${opened} ${side} — close or reduce it before taking this one`,
@@ -1185,15 +1167,23 @@ export function withOpenTradeRules(
           0,
           600
         ),
-    };
-  }
-  return {
-    ...signal,
-    factors: [
-      `The open ${opened} ${side} keeps running on its own levels`,
-      ...signal.factors,
-    ].slice(0, 5),
+    },
   };
+}
+
+/** Event kind recording that a window's analysis carried an open trade. */
+function carryKind(windowKey: string, reconfirmed: boolean) {
+  return `CARRY:${windowKey}:${reconfirmed ? 'SAME' : 'NEUTRAL'}`;
+}
+
+async function carriedThisWindow(predictionId: string, windowKey: string) {
+  const found = await prisma.signalEvent.findFirst({
+    where: {
+      predictionId: Number(predictionId),
+      kind: { startsWith: `CARRY:${windowKey}:` },
+    },
+  });
+  return Boolean(found);
 }
 
 // ---- Trade management on H1 closes ------------------------------------------
@@ -1530,12 +1520,17 @@ export async function getOrCreatePredictions(
   const activeRows = await Promise.all(
     pairs.map((pair) => activePrediction(pair, now))
   );
+  // Earlier trades still running: a window's analysis may carry them forward.
+  const open = await getOpenTrades(now).catch(() => [] as Prediction[]);
   const targets: GenerationTarget[] = [];
   const closedRows = new Map<PairCode, DbPrediction>();
 
   for (const [index, pair] of pairs.entries()) {
     const active = activeRows[index];
     if (!active) {
+      // Already analysed this window and carried the open trade: nothing to do.
+      const prior = open.find((t) => t.pairCode === pair);
+      if (prior && (await carriedThisWindow(prior.id, window.key))) continue;
       targets.push({ pair });
       continue;
     }
@@ -1599,9 +1594,28 @@ export async function getOrCreatePredictions(
   let signals: Prediction[] = [];
   try {
     signals = await liveIntradayPredictions(now, window, targets);
-    // Don't stack a duplicate entry on a trade that is still running.
-    const open = await getOpenTrades(now).catch(() => [] as Prediction[]);
-    signals = signals.map((signal) => withOpenTradeRules(signal, open));
+    // Same direction (or neutral) as a trade still running: carry that trade
+    // instead of publishing — one trade, counted once.
+    const published: Prediction[] = [];
+    for (const signal of signals) {
+      const decision = openTradeDecision(signal, open);
+      if (decision.action === 'publish') {
+        published.push(decision.signal);
+        continue;
+      }
+      await prisma.signalEvent
+        .create({
+          data: {
+            predictionId: Number(decision.prior.id),
+            kind: carryKind(window.key, decision.reconfirmed),
+          },
+        })
+        .catch(() => undefined); // already recorded this window
+      console.info(
+        `${signal.pairCode}: ${window.label} analysis ${decision.reconfirmed ? 're-confirmed' : 'is neutral on'} the open trade #${decision.prior.id}; carried, nothing new published.`
+      );
+    }
+    signals = published;
   } catch (error) {
     console.warn(
       'Intraday generation unavailable; keeping the stored signals.',
@@ -1675,6 +1689,8 @@ export async function getHistory(
   const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
   const rows = await prisma.prediction.findMany({
     where: {
+      // Legacy "hold" rows managed another trade; they are not results.
+      continuesId: null,
       expiresAt: { lte: now, gte: since },
       ...(options?.session ? { session: options.session } : {}),
       ...(options?.pair ? { pairCode: options.pair } : {}),
@@ -2356,8 +2372,11 @@ export async function getDashboardFromDatabase(
     ]);
 
   const [totalSignals, average, hits, misses] = await Promise.all([
-    prisma.prediction.count(),
-    prisma.prediction.aggregate({ _avg: { confidence: true } }),
+    prisma.prediction.count({ where: { continuesId: null } }),
+    prisma.prediction.aggregate({
+      where: { continuesId: null },
+      _avg: { confidence: true },
+    }),
     prisma.predictionOutcome.count({ where: { status: 'HIT' } }),
     prisma.predictionOutcome.count({ where: { status: 'MISSED' } }),
   ]);
@@ -2371,7 +2390,40 @@ export async function getDashboardFromDatabase(
     eventRows.length > 0 ||
     weeklyOutlook.length > 0;
 
-  const openTrades = await getOpenTrades(now).catch(() => [] as Prediction[]);
+  let openTrades = await getOpenTrades(now).catch(() => [] as Prediction[]);
+  // A pair with no new signal but a trade carried by the latest analysis
+  // shows that trade as its current signal (one trade, one card).
+  const carried: Prediction[] = [];
+  if (open) {
+    for (const pair of pairs) {
+      if (predictions.some((p) => p.pairCode === pair)) continue;
+      const trade = openTrades.find((t) => t.pairCode === pair);
+      if (!trade) continue;
+      const event = await prisma.signalEvent.findFirst({
+        where: {
+          predictionId: Number(trade.id),
+          kind: { startsWith: 'CARRY:' },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (!event) continue;
+      const [, key, verdict] = event.kind.split(':');
+      const windowLabel = key?.endsWith('LONDON')
+        ? 'London'
+        : key?.endsWith('NEW_YORK')
+          ? 'New York'
+          : 'Asia';
+      carried.push({
+        ...trade,
+        carried: {
+          reconfirmed: verdict === 'SAME',
+          window: windowLabel,
+          at: event.createdAt.toISOString(),
+        },
+      });
+    }
+    openTrades = openTrades.filter((t) => !carried.some((c) => c.id === t.id));
+  }
   const withLive = await Promise.all(
     predictions.map(async (p) => {
       // A hold shows the progress of the trade it is managing.
@@ -2391,7 +2443,9 @@ export async function getDashboardFromDatabase(
   return {
     ...empty,
     marketStatus: open ? 'OPEN' : 'CLOSED',
-    predictions: withLive,
+    predictions: [...withLive, ...carried].sort((a, b) =>
+      a.pairCode.localeCompare(b.pairCode)
+    ),
     openTrades,
     history,
     events: eventRows.map(eventFromRow),

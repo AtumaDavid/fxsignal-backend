@@ -61,7 +61,7 @@ router.get(
       return res.status(401).json({ error: 'Account no longer exists.' });
     const plan = planFor(user.plan);
     const [totalSignals, hits, misses] = await Promise.all([
-      prisma.prediction.count(),
+      prisma.prediction.count({ where: { continuesId: null } }),
       prisma.predictionOutcome.count({ where: { status: 'HIT' } }),
       prisma.predictionOutcome.count({ where: { status: 'MISSED' } }),
     ]);
