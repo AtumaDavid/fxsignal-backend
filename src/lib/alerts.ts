@@ -297,7 +297,7 @@ function targets(p: Prediction) {
     : `target ${px(p, p.targetPrice)} (${p.riskReward ?? '—'}R)`;
 }
 
-function compose(
+export function composeAlert(
   kind: AlertKind,
   p: Prediction,
   extra: { price?: number | null; pips?: number | null; note?: string | null }
@@ -389,7 +389,7 @@ export async function announceSignalEvent(
     throw error;
   }
   if (options.silent) return;
-  const { title, body } = compose(kind, p, extra);
+  const { title, body } = composeAlert(kind, p, extra);
   console.info(`Alert ${kind} #${predictionId}: ${title}`);
   await fanOut({ kind, title, body, predictionId, path: '/app/signals' });
 }

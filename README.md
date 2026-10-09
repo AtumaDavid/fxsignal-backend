@@ -22,6 +22,7 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `npm run dev` | Watch mode (`tsx watch`) |
 | `npm start` | Run once (`tsx src/index.ts`); used by PM2 in production |
 | `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | Unit tests (vitest): scoring, settlement, H1 checkpoint, carry, alerts, windows, recap, backtest, MT5 matching. Also run by GitHub Actions on every push |
 | `npm run db:generate` | Generate the Prisma client |
 | `npm run db:push` | Push `prisma/schema.prisma` to the database |
 | `npm run db:init` | Push the schema and seed the demo user |
@@ -43,6 +44,8 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `LIVE_PROGRESS_REFRESH_MINUTES` | How often M15 candles refresh while a signal is open (default 30, 1 credit per pair; `0` disables) |
 | `LIVE_DATA_ENABLED`, `AI_ANALYSIS_ENABLED` | Feature switches (`true` / `false`) |
 | `MARKET_CACHE_FILE` | Optional path for the restart-safe provider cache (default `.cache/market-cache.json`) |
+| `ADMIN_EMAILS` | Comma-separated emails of accounts that can open `/app/admin` |
+| `TWELVE_DATA_CREDITS_PER_DAY` | Daily credit allowance shown on the admin page (default 800, the free plan) |
 
 ## API
 
@@ -63,6 +66,13 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `GET` / `PUT` | `/api/notifications`, `/api/notifications/settings` | ✓ | Alert bell feed / alert channels and events |
 | `POST` | `/api/notifications/read`, `/push/subscribe`, `/push/unsubscribe`, `/test` | ✓ | Mark read, browser push devices, send a test alert |
 | `GET` | `/api/public/track-record?days=30\|90\|365` | — | Public track record (60/min per IP, cached 5 min) |
+| `GET` | `/api/public/backtest` | — | Newest finished backtest with every simulated trade |
+| `GET` | `/api/recap?week=YYYY-MM-DD` | ✓ | Weekly recap (engine results + your journal) for the week starting that Monday |
+| `GET` / `PUT` | `/api/risk` | ✓ | Risk guardrails (daily loss limit, max trades per day; off by default) |
+| `GET` / `POST` / `DELETE` | `/api/mt5`, `/api/mt5/key` | ✓ | MT5 sync status / create a sync key (shown once) / disconnect |
+| `POST` | `/api/mt5/sync` | sync key | Called by the FXSignal-Sync EA: positions → journal (30/min per IP) |
+| `GET` | `/api/admin/overview`, `/api/admin/users`, `/api/admin/backtest` | admin | Health, credits, alert failures / users / backtest runs |
+| `PATCH` / `POST` | `/api/admin/users/:id`, `/api/admin/backtest` | admin | Set a user's plan / start a backtest (`{ "months": 1–12 }`) |
 | `GET` | `/api/billing/plans`, `/api/billing/account` | –/✓ | Plans and usage |
 | `POST` | `/api/billing/checkout` | ✓ | Change plan (simulated; connect Stripe before taking payments) |
 
@@ -74,6 +84,8 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 - **Early re-checks:** when a trade hits target or stop during London or New York, the pair is re-read at the next H1 close (after a stop, H1 must clearly agree with the context). Max 2 trades per pair per window, one re-check per H1 candle, none in the last 45 minutes of a window. Each re-check costs ~2 Twelve Data credits (H1 + M15; Daily/H4 cached) plus one DeepSeek call.
 - **Model:** Daily + H4 set the direction; H1 executes (it must not oppose the context, and its ATR and last 10 bars of structure place the zone and stop); M15 only adjusts confidence. Every signal is at least 2R from the zone midpoint, or it stands aside.
 - **Model review:** DeepSeek may keep or downgrade the direction, never flip it; its levels are pushed to 2R or replaced by the engine's.
+- **Backtest:** `src/lib/backtest.ts` replays the rule engine at every session window over 1–12 months, with the same M15 replay and H1 checkpoint, and stores the run. History is downloaded once (about 7 credits per pair) and cached in `.cache/history/`, so re-runs of the same range are free. Rules only (no model review), one trade per pair per window, no re-checks, no spread. Start runs from the admin page; the newest finished run is shown on the public track record.
+- **MT5 sync:** read-only. A user creates a sync key in Settings; the `FXSignal-Sync.mq5` EA (served by the frontend at `/downloads/FXSignal-Sync.mq5`) posts their EUR/USD and USD/JPY positions every minute. Positions are matched to the signal of the same pair and direction opened during its window, merged per signal (one per TP becomes one trade) and written to the journal. The key is stored as a SHA-256 hash.
 - **Trade management:** three targets, a third of the position at each: TP1 = +1R (derived), TP2 = the published 2R target (`targetPrice`), TP3 = one more R (`target3Price`, stored in the `target2Price` column). The stop trails to entry after TP1 and to TP1 after TP2, from the next candle. Scored for the whole position: −1R stop, +⅓R TP1-then-entry, +1⅓R TP2-then-TP1, +2R all three. Every step (entry, TP1, TP2, TP3, stop, trailed-stop close) is a separate alert (bell, email, push). Signals published before this keep their single target; `BREAKEVEN` remains only for rows scored under the earlier two-target rule. Schema changes are applied by the startup patch; no manual migration.
 - **Settlement:** each signal is replayed on M15 candles (H1 fallback). No fill in its window means no trade. A filled trade is followed after its window, even when newer signals appear, until target or stop trades (stop first if both share a candle), or the Friday close, where it is marked to the last price. Neutral calls are never scored.
 - **H1 checkpoint:** on every closed H1 candle, open signals and trades are re-checked (no model calls, ~1 Twelve Data credit per pair per hour while something is open). Before entry, a broken setup (H1 against the context, context flipped, or a close beyond the stop) is `CANCELLED` and not scored; the pair is re-read at a later H1 close with H1 required to agree again. After entry, a trade is `CLOSED_EARLY` only when the same H1 close is back through the far side of the entry zone and H1 or H4 points against it; early exits count in net pips but not the hit rate.
@@ -378,6 +390,7 @@ cd ~/fxsignal-backend
 git pull
 npm install
 npm run db:generate
+npm test            # stops the deploy if a change broke scoring or alerts
 pm2 restart fxsignal --update-env
 pm2 status
 ```
