@@ -32,8 +32,15 @@ router.get('/track-record', async (req, res) => {
   }
 
   try {
-    const rows = await getHistory(1000, new Date(), { days, maxRows: 1000 });
-    const settled = rows.filter((row) => row.outcome?.status !== 'PENDING');
+    const rows = await getHistory(1000, new Date(), {
+      days,
+      maxRows: 1000,
+      includeStandAsides: true,
+    });
+    // Recent calls: trades only (stand-asides are counted, not listed).
+    const settled = rows.filter(
+      (row) => row.outcome?.status !== 'PENDING' && row.direction !== 'NEUTRAL'
+    );
     const body = {
       days,
       generatedAt: new Date().toISOString(),

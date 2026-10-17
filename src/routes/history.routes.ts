@@ -22,6 +22,8 @@ const querySchema = z.object({
   session: z.enum(SESSIONS).optional(),
   days: z.coerce.number().int().min(1).max(365).default(30),
   limit: z.coerce.number().int().min(1).max(200).default(50),
+  /** 1 includes Neutral stand-asides (left out by default: not outcomes). */
+  standAsides: z.enum(['0', '1']).default('0'),
 });
 
 async function planForRequest(sub: string | undefined) {
@@ -53,6 +55,7 @@ router.get('/', async (req, res) => {
       days,
       session: parsed.data.session,
       pair: parsed.data.pair as PairCode | undefined,
+      includeStandAsides: parsed.data.standAsides === '1',
     });
     return res.json({
       items,
@@ -84,7 +87,11 @@ router.get('/performance', async (req, res) => {
   try {
     const plan = await planForRequest(req.user?.sub);
     const days = Math.min(parsed.data.days, plan.limits.historyDays);
-    const rows = await getHistory(1000, new Date(), { days, maxRows: 1000 });
+    const rows = await getHistory(1000, new Date(), {
+      days,
+      maxRows: 1000,
+      includeStandAsides: true,
+    });
     return res.json({
       ...buildPerformance(rows),
       appliedDays: days,

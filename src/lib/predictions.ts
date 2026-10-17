@@ -2056,10 +2056,14 @@ export async function getOpenTrades(now = new Date()): Promise<Prediction[]> {
     const p = fromRow(row);
     const holdUntil = tradeHoldUntil(row.validFrom);
     const live = await liveProgress(p, now < holdUntil ? now : holdUntil);
-    // Only trades that actually filled; unfilled windows are just awaiting settlement.
-    if (live && live.state !== 'waiting' && live.state !== 'neutral') {
-      trades.push({ ...p, live });
-    }
+    // Only trades that actually filled; unfilled windows are just awaiting
+    // settlement. The cached M15 series covers about two days, so an older
+    // trade may not replay from the cache: settlement's stored fill (it
+    // records one while the trade runs past its window) still marks it open.
+    const filled =
+      (live && live.state !== 'waiting' && live.state !== 'neutral') ||
+      row.outcome?.filledAt != null;
+    if (filled) trades.push({ ...p, live: live ?? null });
   }
   return trades;
 }
@@ -2431,6 +2435,11 @@ export async function getHistory(
     pair?: PairCode;
     /** Internal reads (performance) may exceed the 200-row page size. */
     maxRows?: number;
+    /**
+     * Neutral stand-asides are kept (analytics, the stand-aside count) but
+     * are not outcomes, so lists leave them out unless asked.
+     */
+    includeStandAsides?: boolean;
   }
 ) {
   // Read-only: expired-signal evaluation is owned by maintainMarketData().
@@ -2441,6 +2450,7 @@ export async function getHistory(
       // Legacy "hold" rows managed another trade; they are not results.
       continuesId: null,
       expiresAt: { lte: now, gte: since },
+      ...(options?.includeStandAsides ? {} : { direction: { not: 'NEUTRAL' } }),
       ...(options?.session ? { session: options.session } : {}),
       ...(options?.pair ? { pairCode: options.pair } : {}),
     },
@@ -3268,7 +3278,7 @@ export async function getDashboardFromDatabase(
         orderBy: { eventDate: 'asc' },
         take: 6,
       }),
-      getHistory(12, now),
+      getHistory(20, now),
       prisma.weeklyOutlook.findMany({
         where: { weekKey },
         orderBy: { pairCode: 'asc' },
@@ -3371,7 +3381,9 @@ export async function getDashboardFromDatabase(
       .map(withNews)
       .sort((a, b) => a.pairCode.localeCompare(b.pairCode)),
     openTrades: openTrades.map(withNews),
-    history,
+    // Settled trades only: a trade still running past its window is shown as
+    // the pair's current signal ("Still valid"), not listed again here.
+    history: history.filter((p) => p.outcome?.status !== 'PENDING'),
     events: eventRows.map(eventFromRow),
     prices,
     weeklyOutlook,
