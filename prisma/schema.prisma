@@ -55,6 +55,8 @@ model User {
   trades            UserTrade[]
   /// Alert channels and events (see src/lib/alerts.ts for the shape/defaults).
   alertPrefs        Json?
+  /// External alert destinations (Telegram chat, Discord/webhook URLs); see externalAlerts.ts.
+  alertTargets      Json?
   /// Risk guardrails: daily loss limit and max trades per day (off by default).
   riskPrefs         Json?
   /// Last authenticated request (updated at most every few minutes).
@@ -102,6 +104,16 @@ model Prediction {
   targetPips        Decimal?           @db.Decimal(12, 2)
   riskReward        Decimal?           @db.Decimal(8, 2)
   atrPips           Decimal?           @db.Decimal(12, 2)
+  /// TOUCH (null on older rows) or M15_CLOSE: see EntryTrigger in model.ts.
+  entryTrigger      String?
+  /// High-impact news windows [{from, to, title}] (ms) in which no entry fills.
+  noEntryWindows    Json?
+  /// Why a Neutral call stood aside (see ReasonCode in model.ts).
+  reasonCode        String?
+  /// Rule snapshot this signal was built with (strategy.ts).
+  strategy          Json?
+  /// Market conditions at publish (regime, volatility, news) for analytics.
+  features          Json?
   /// Set on a "hold" call: the still-open earlier signal this window manages
   /// instead of publishing a duplicate entry.
   continuesId       Int?
@@ -126,6 +138,11 @@ model PredictionOutcome {
   evaluatedAt   DateTime?
   source        OutcomeSource @default(DEMO)
   note          String?
+  /// Why it ended without a position, or was cancelled (ReasonCode).
+  reasonCode    String?
+  /// The engine's own entry: confirming close (M15_CLOSE) or zone midpoint.
+  fillPrice     Decimal?      @db.Decimal(16, 6)
+  filledAt      DateTime?
   prediction    Prediction    @relation(fields: [predictionId], references: [id], onDelete: Cascade)
 }
 
@@ -204,6 +221,12 @@ model UserTrade {
   source       String?
   /// MT5 position ids behind this trade (comma-separated).
   externalRef  String?
+  /// Broker commission and swap in account currency (MT5), or the user's
+  /// configured commission for hand-logged trades.
+  commission   Decimal?   @db.Decimal(12, 2)
+  swap         Decimal?   @db.Decimal(12, 2)
+  /// Live spread (pips) when the trade was synced or logged.
+  spreadPips   Decimal?   @db.Decimal(8, 2)
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -276,6 +299,8 @@ model BacktestRun {
   summary    Json?
   trades     Json?
   error      String?
+  /// Rule snapshot the run replayed (strategy.ts).
+  strategy   Json?
 
   @@index([createdAt])
 }
@@ -293,4 +318,24 @@ model Mt5Link {
   lastBroker    String?
   lastPositions Int?
   lastMatched   Int?
+  /// Account snapshot from the last sync (equity-based sizing, drawdown pause).
+  lastBalance   Decimal?  @db.Decimal(16, 2)
+  lastEquity    Decimal?  @db.Decimal(16, 2)
+  lastCurrency  String?
+  /// Highest equity seen, for the drawdown pause.
+  peakEquity    Decimal?  @db.Decimal(16, 2)
+}
+
+/// Live bid/ask reported by an MT5 terminal (the FXSignal Sync EA).
+model SpreadSample {
+  id         Int      @id @default(autoincrement())
+  pairCode   String
+  bid        Decimal  @db.Decimal(16, 6)
+  ask        Decimal  @db.Decimal(16, 6)
+  spreadPips Decimal  @db.Decimal(8, 2)
+  at         DateTime
+  broker     String?
+  userId     Int?
+
+  @@index([pairCode, at])
 }

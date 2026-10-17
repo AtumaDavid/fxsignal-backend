@@ -11,6 +11,9 @@ import {
   createEmptyDashboard,
   type DashboardData,
   type Direction,
+  type EntryTrigger,
+  type ReasonCode,
+  type LifecycleStage,
   type LiveProgress,
   type NewsRisk,
   type OutcomeStatus,
@@ -44,6 +47,8 @@ import {
   confluence,
   enforceMinRewardRisk,
   intradayConfluence,
+  MAX_RISK_PIPS,
+  MIN_REWARD_RISK,
   type Candle,
   type Confluence,
   type Timeframe,
@@ -69,6 +74,24 @@ import {
   type MultiTimeframe,
 } from './liveData.js';
 import { peekStale } from './rateCache.js';
+import { signalFeatures, type SignalFeatures } from './regime.js';
+import { liveSpread, MAX_SPREAD_PIPS, pruneSpreadSamples } from './execution.js';
+import { strategySnapshot, type StrategySnapshot } from './strategy.js';
+import {
+  blackoutsFromJson,
+  newsBlackouts,
+  portfolioBlock,
+  EXECUTION_COST_PIPS,
+  type Blackout,
+  type Exposure,
+} from './risk.js';
+import {
+  buildZoneMap,
+  planZoneTrade,
+  roomCheck,
+  zoneRange,
+  type ZoneSourceSet,
+} from './zones.js';
 import { announceMyTradeClosed, announceSignalEvent } from './alerts.js';
 
 const pairs: PairCode[] = [...PAIRS];
@@ -96,8 +119,24 @@ function outcomeFromRow(row: DbPrediction['outcome']): Prediction['outcome'] {
     evaluatedAt: row.evaluatedAt?.toISOString() ?? null,
     source: row.source as 'LIVE' | 'DEMO',
     note: row.note,
+    reasonCode: (row.reasonCode as ReasonCode | null) ?? null,
+    fillPrice: row.fillPrice === null ? null : Number(row.fillPrice),
+    filledAt: row.filledAt?.toISOString() ?? null,
   };
 }
+
+function strategyFromJson(value: unknown): Prediction['strategy'] {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as { version?: unknown; fingerprint?: unknown };
+  return typeof v.version === 'string' && typeof v.fingerprint === 'string'
+    ? { version: v.version, fingerprint: v.fingerprint }
+    : null;
+}
+
+/** A call about to be stored: the full rule snapshot and features ride along. */
+type PublishedPrediction = Prediction & {
+  meta?: { strategy: StrategySnapshot; features: SignalFeatures };
+};
 
 function votesFromJson(value: unknown): TimeframeVote[] | null {
   if (!Array.isArray(value)) return null;
@@ -144,6 +183,10 @@ export function fromRow(row: DbPrediction): Prediction {
     session: row.session,
     playbook: row.playbook ?? null,
     timeframeBias: votesFromJson(row.timeframeBias),
+    entryTrigger: row.entryTrigger === 'M15_CLOSE' ? 'M15_CLOSE' : 'TOUCH',
+    blackouts: blackoutsFromJson(row.noEntryWindows),
+    reasonCode: (row.reasonCode as ReasonCode | null) ?? null,
+    strategy: strategyFromJson(row.strategy),
     stopPips: row.stopPips === null ? null : Number(row.stopPips),
     targetPips: row.targetPips === null ? null : Number(row.targetPips),
     riskReward: row.riskReward === null ? null : Number(row.riskReward),
@@ -265,6 +308,18 @@ interface DeterministicSignal {
   atrPips: number | null;
   price: number;
   confluence: Confluence;
+  /** Which level model built it (names the engine version). */
+  levelModel: 'zones' | 'atr';
+  /** How the entry fills: M15_CLOSE for zone trades. */
+  entryTrigger: EntryTrigger;
+  /** High-impact news windows in which no entry may fill. */
+  blackouts: Blackout[];
+  /** Why it stands aside, on a Neutral call. */
+  reasonCode: ReasonCode | null;
+  /** Market conditions at publish, for analytics only. */
+  features: SignalFeatures;
+  /** The zone the trade is located at (zone model), e.g. "Daily support + H4 demand". */
+  zone: { label: string; low: number; high: number; orderBlock: boolean } | null;
   /** Inputs to rebuild engine levels if the model review moves them badly. */
   levelInputs: {
     atr: number | null;
@@ -279,12 +334,20 @@ const STRICT_MIN_CONFIDENCE = 70;
 export const MAX_SIGNALS_PER_WINDOW = 2;
 
 /** Engine version recorded on rule-built signals. */
-const ENGINE_MODEL = 'ctx-h1-exec-v3';
+const ENGINE_MODEL = {
+  atr: 'ctx-h1-exec-v4',
+  zones: 'ctx-zone-v4',
+} as const;
 
 /** Intraday model: Daily + H4 context, H1 execution, M15 confirmation. */
 export const INTRADAY_TIMEFRAMES: Timeframe[] = ['DAILY', 'H4', 'H1', 'M15'];
-/** H1 bars that define the execution structure (stop placement). */
+/** H1 bars that define the execution structure (stop placement, atr model). */
 const H1_STRUCTURE_BARS = 10;
+/** Zone model: how far from price a zone may sit and still be traded this window. */
+const ZONE_REACH_ATR = 1.5;
+const ZONE_REACH_MIN_PIPS = 15;
+/** Zone model: the stop is at least this many H1 ATRs from the entry midpoint. */
+const ZONE_STOP_ATR = 0.6;
 
 function catalystPenalty(
   events: LiveMarketEvent[],
@@ -316,8 +379,25 @@ export function buildDeterministicSignal(
     strict?: boolean;
     /** Re-check after a stop: H1 must positively agree with the context. */
     requireH1Aligned?: boolean;
+    /**
+     * atr (default): an ATR-sized zone around the current price, stop beyond
+     * the recent H1 structure. zones: trade only from a higher-timeframe zone
+     * (see zones.ts) — it backtested worse (docs/technical-guide.md 5.1), so
+     * it is opt-in.
+     */
+    levelModel?: 'zones' | 'atr';
+    /** Entry rule for the atr model (default M15_CLOSE; zones always use it). */
+    entryTrigger?: EntryTrigger;
+    /**
+     * Stand aside when a higher-timeframe zone sits before the target
+     * (zones: on unless false; atr: off unless true).
+     */
+    requireRoom?: boolean;
+    /** Which zone sources to build (all by default). */
+    zoneSources?: ZoneSourceSet;
   } = {}
 ): DeterministicSignal | null {
+  const levelModel = options.levelModel ?? 'atr';
   const views: TimeframeView[] = [];
   for (const tf of INTRADAY_TIMEFRAMES) {
     const candles = mtf[tf];
@@ -334,16 +414,25 @@ export function buildDeterministicSignal(
   const penalty = catalystPenalty(events, now, options.windowEnd);
   const conf = intradayConfluence(views, penalty);
   if (!conf) return null;
+  // Why the call stands aside, when it does (first reason wins).
+  let reasonCode: ReasonCode | null =
+    conf.direction !== 'NEUTRAL'
+      ? null
+      : Math.abs(conf.score) >= 15
+        ? 'H1_AGAINST'
+        : 'CONTEXT_NEUTRAL';
   if (conf.direction !== 'NEUTRAL') {
     if (
       options.strict &&
       (conf.confidence < STRICT_MIN_CONFIDENCE || !conf.h1Aligned)
     ) {
+      reasonCode = 'STRICT_WINDOW';
       conf.notes.unshift(
         `${session} is a lighter window: only fully aligned setups (${STRICT_MIN_CONFIDENCE}%+ confidence, H1 aligned) are published.`
       );
       conf.direction = 'NEUTRAL';
     } else if (options.requireH1Aligned && !conf.h1Aligned) {
+      reasonCode = 'H1_NOT_REALIGNED';
       conf.notes.unshift(
         'After a stop, H1 must clearly agree with the context again before a new entry.'
       );
@@ -362,18 +451,98 @@ export function buildDeterministicSignal(
     : h1.swingLow;
 
   let direction = conf.direction;
+  const costPips = EXECUTION_COST_PIPS[pair];
   let levels = buildDayTradeLevels(
     pair,
     direction,
     price,
     h1.atr,
     swingHigh,
-    swingLow
+    swingLow,
+    costPips
   );
   const notes = [...conf.notes];
+  let zone: DeterministicSignal['zone'] = null;
+  if (levelModel === 'zones' && direction !== 'NEUTRAL') {
+    // Location: a higher-timeframe zone within reach of price, with room for
+    // 2R before the next opposing zone; otherwise stand aside.
+    const map = buildZoneMap(pair, mtf, price, now.getTime(), options.zoneSources);
+    const result = planZoneTrade(pair, direction, map, {
+      reach: Math.max(ZONE_REACH_MIN_PIPS * pipSize(pair), ZONE_REACH_ATR * (h1.atr ?? 0)),
+      minR: MIN_REWARD_RISK,
+      maxRiskPips: MAX_RISK_PIPS,
+      // Same volatility floor as the ATR model's stop.
+      minRisk: ZONE_STOP_ATR * (h1.atr ?? 0),
+      requireRoom: options.requireRoom,
+      costPips,
+    });
+    if (result.ok) {
+      const { plan } = result;
+      levels = {
+        ...levels,
+        entryLow: plan.entryLow,
+        entryHigh: plan.entryHigh,
+        invalidationPrice: plan.invalidationPrice,
+        targetPrice: plan.targetPrice,
+        tradeable: true,
+        reason: null,
+      };
+      zone = {
+        label: plan.orderBlock
+          ? `H1 order block inside ${plan.zone.label.replace(/ \+ H1 bullish order block| \+ H1 bearish order block/g, '')}`
+          : plan.zone.label,
+        low: roundToPip(pair, plan.zone.low),
+        high: roundToPip(pair, plan.zone.high),
+        orderBlock: Boolean(plan.orderBlock),
+      };
+      notes.unshift(
+        `Location: ${zone.label} (${zoneRange(pair, plan.zone)}).` +
+          (plan.opposing
+            ? ` Next opposing zone: ${plan.opposing.label} at ${zoneRange(pair, plan.opposing)}.`
+            : '')
+      );
+    } else {
+      notes.unshift(result.reason);
+      reasonCode = result.code;
+      direction = 'NEUTRAL';
+      levels = buildDayTradeLevels(pair, direction, price, h1.atr, swingHigh, swingLow);
+    }
+  }
+  if (levelModel === 'atr' && options.requireRoom && direction !== 'NEUTRAL' && levels.tradeable) {
+    const map = buildZoneMap(pair, mtf, price, now.getTime(), options.zoneSources);
+    const room = roomCheck(pair, direction, map, levels);
+    if (!room.ok) {
+      notes.unshift(room.reason);
+      reasonCode = 'NO_ROOM';
+      direction = 'NEUTRAL';
+      levels = buildDayTradeLevels(pair, direction, price, h1.atr, swingHigh, swingLow);
+    }
+  }
+  const entryTrigger: EntryTrigger =
+    levelModel === 'zones' ? 'M15_CLOSE' : (options.entryTrigger ?? 'M15_CLOSE');
+  // High-impact releases in the window: no entry may fill inside them.
+  const blackouts =
+    direction === 'NEUTRAL'
+      ? []
+      : newsBlackouts(
+          events,
+          pair,
+          now.getTime(),
+          (options.windowEnd ?? new Date(now.getTime() + 5 * 3_600_000)).getTime()
+        );
+  if (blackouts.length > 0)
+    notes.push(
+      `No entry ${blackouts
+        .map(
+          (b) =>
+            `${new Date(b.from).toISOString().slice(11, 16)}–${new Date(b.to).toISOString().slice(11, 16)} UTC (${b.title})`
+        )
+        .join(', ')}.`
+    );
   if (!levels.tradeable) {
     // Structure too wide for 1:2 — say so and stand aside instead of
     // publishing a worse ratio.
+    reasonCode = 'STOP_TOO_WIDE';
     notes.unshift(
       levels.reason ?? 'Setup does not offer 1:2 — standing aside.'
     );
@@ -408,9 +577,13 @@ export function buildDeterministicSignal(
   const rationale =
     direction === 'NEUTRAL'
       ? `No execution this window. Context (daily + H4) is ${contextWord}; ${notes[0] ?? ''} Votes: ${voteWords}.`
-      : `Daily + H4 context is ${contextWord}; H1 is the execution timeframe and M15 the confirmation. ` +
-        `Votes: ${voteWords}. Stop beyond the last ${H1_STRUCTURE_BARS} H1 bars' structure ` +
-        `(${risk.stopPips} pips) for a ${risk.targetPips}-pip target (${risk.riskReward}R). ${session} session — ${killzoneHint}`;
+      : zone
+        ? `Daily + H4 context is ${contextWord}; the trade is located at ${zone.label} (${zone.low}–${zone.high}) and triggers on an M15 close. ` +
+          `Votes: ${voteWords}. Stop beyond the zone (${risk.stopPips} pips) for a ${risk.targetPips}-pip target (${risk.riskReward}R) ` +
+          `with room before the next opposing zone. ${session} session — ${killzoneHint}`
+        : `Daily + H4 context is ${contextWord}; H1 is the execution timeframe and M15 the confirmation. ` +
+          `Votes: ${voteWords}. Stop beyond the last ${H1_STRUCTURE_BARS} H1 bars' structure ` +
+          `(${risk.stopPips} pips) for a ${risk.targetPips}-pip target (${risk.riskReward}R). ${session} session — ${killzoneHint}`;
 
   const factors = [
     ...notes.slice(0, 4),
@@ -425,10 +598,13 @@ export function buildDeterministicSignal(
   const playbook =
     direction === 'NEUTRAL'
       ? `${session}: stand aside. Re-check when H1 realigns with the daily/H4 context, or at the next window.`
-      : `${session} plan: ${side} only, executed on H1 inside ${guarded.entryLow}–${guarded.entryHigh}. ` +
-        `Before entering, wait for an M15 candle to close in the ${side} direction inside the zone. ` +
+      : `${session} plan: ${side} only, from ${zone ? zone.label : 'the H1 entry zone'} at ${guarded.entryLow}–${guarded.entryHigh}. ` +
+        `${zone ? 'Wait for price to reach the zone, then' : 'Before entering,'} wait for an M15 candle to close in the ${side} direction inside the zone. ` +
         `Invalidate ${direction === 'LONG' ? 'below' : 'above'} ${guarded.invalidationPrice} (${risk.stopPips}p); ` +
-        `target ${guarded.targetPrice} (${risk.targetPips}p, ${risk.riskReward}R). Skip it if a high-impact release lands before the trigger.`;
+        `target ${guarded.targetPrice} (${risk.targetPips}p, ${risk.riskReward}R). ` +
+        (blackouts.length > 0
+          ? `No entry ${blackouts.map((b) => `${new Date(b.from).toISOString().slice(11, 16)}–${new Date(b.to).toISOString().slice(11, 16)} UTC`).join(', ')} (high-impact news).`
+          : 'Skip it if a high-impact release lands before the trigger.');
 
   return {
     pairCode: pair,
@@ -449,6 +625,19 @@ export function buildDeterministicSignal(
     atrPips: levels.atrPips,
     price,
     confluence: { ...conf, direction, notes },
+    levelModel,
+    entryTrigger,
+    zone,
+    blackouts,
+    reasonCode: direction === 'NEUTRAL' ? (reasonCode ?? 'CONTEXT_NEUTRAL') : null,
+    features: signalFeatures({
+      contextScore: conf.score,
+      daily: views.find((v) => v.timeframe === 'DAILY'),
+      h4: views.find((v) => v.timeframe === 'H4'),
+      h1Candles: mtf.H1 ?? [],
+      newsInWindow:
+        newsBlackouts(events, pair, now.getTime(), (options.windowEnd ?? now).getTime()).length > 0,
+    }),
     levelInputs: { atr: h1.atr, swingHigh, swingLow },
   };
 }
@@ -524,7 +713,7 @@ function toPrediction(
   engine: 'RULE_BASED' | 'DEEPSEEK',
   modelName: string | null,
   ai?: IntradayAiResult
-): Prediction {
+): PublishedPrediction {
   const expiresAt = signalWindowEnd(now);
 
   // The model review may keep the engine's direction or downgrade it to
@@ -540,6 +729,7 @@ function toPrediction(
 
   // Levels: the model's, if they still give at least 1:2 after the
   // guard-rails; otherwise the engine's (built for 2R by construction).
+  // A zone trade keeps the engine's levels: the location is the point of it.
   const engineLevels = {
     pairCode: signal.pairCode,
     direction,
@@ -549,7 +739,7 @@ function toPrediction(
     invalidationPrice: signal.invalidationPrice,
   };
   const modelLevels =
-    aiUsable && direction !== 'NEUTRAL'
+    aiUsable && direction !== 'NEUTRAL' && !signal.zone
       ? enforceMinRewardRisk(
           normalizeLevels({
             pairCode: signal.pairCode,
@@ -558,7 +748,8 @@ function toPrediction(
             entryHigh: aiUsable.entryHigh,
             targetPrice: aiUsable.targetPrice,
             invalidationPrice: aiUsable.invalidationPrice,
-          })
+          }),
+          EXECUTION_COST_PIPS[signal.pairCode]
         )
       : null;
   const { entryLow, entryHigh, targetPrice, invalidationPrice } =
@@ -571,6 +762,11 @@ function toPrediction(
     invalidationPrice,
   });
   ai = aiUsable;
+  const strategy = strategySnapshot({
+    levelModel: signal.levelModel,
+    entryTrigger: signal.entryTrigger,
+    confirmWindowBars: CONFIRM_WINDOW_BARS,
+  });
   return {
     id: '',
     continuesId: null,
@@ -579,7 +775,7 @@ function toPrediction(
     direction,
     // Labelled by what actually shaped the published call.
     engine: aiUsable ? engine : 'RULE_BASED',
-    modelName: aiUsable ? modelName : ENGINE_MODEL,
+    modelName: aiUsable ? modelName : ENGINE_MODEL[signal.levelModel],
     confidence: ai
       ? Math.max(15, Math.min(92, ai.confidence))
       : signal.confidence,
@@ -607,6 +803,16 @@ function toPrediction(
     session: tradingWindowAt(now)?.label ?? 'Off hours',
     playbook: (ai?.playbook ?? signal.playbook).slice(0, 600),
     timeframeBias: signal.votes,
+    entryTrigger: signal.entryTrigger,
+    blackouts: direction === 'NEUTRAL' ? [] : signal.blackouts,
+    reasonCode:
+      direction !== 'NEUTRAL'
+        ? null
+        : signal.direction !== 'NEUTRAL'
+          ? 'MODEL_DOWNGRADE'
+          : signal.reasonCode,
+    strategy: { version: strategy.version, fingerprint: strategy.fingerprint },
+    meta: { strategy, features: signal.features },
     stopPips: risk.stopPips,
     targetPips: risk.targetPips,
     riskReward: risk.riskReward,
@@ -621,11 +827,14 @@ function toPrediction(
       evaluatedAt: null,
       source: 'LIVE',
       note: 'Waiting for a live price evaluation.',
+      reasonCode: null,
+      fillPrice: null,
+      filledAt: null,
     },
   };
 }
 
-async function insertPrediction(prediction: Prediction) {
+async function insertPrediction(prediction: PublishedPrediction) {
   return prisma.prediction.create({
     data: {
       pairCode: prediction.pairCode,
@@ -639,6 +848,18 @@ async function insertPrediction(prediction: Prediction) {
       targetPrice: prediction.targetPrice,
       target3Price: prediction.target3Price,
       invalidationPrice: prediction.invalidationPrice,
+      entryTrigger: prediction.entryTrigger,
+      noEntryWindows:
+        prediction.blackouts.length > 0
+          ? (prediction.blackouts as unknown as Prisma.InputJsonValue)
+          : Prisma.JsonNull,
+      reasonCode: prediction.reasonCode,
+      strategy: prediction.meta
+        ? (prediction.meta.strategy as unknown as Prisma.InputJsonValue)
+        : Prisma.JsonNull,
+      features: prediction.meta
+        ? (prediction.meta.features as unknown as Prisma.InputJsonValue)
+        : Prisma.JsonNull,
       rationale: prediction.rationale,
       factors: prediction.factors,
       session: prediction.session,
@@ -677,6 +898,20 @@ interface GenerationTarget {
   rearmAfter?: 'target' | 'stopped';
 }
 
+/**
+ * The engine the live signals (and the admin backtest) use: the ATR entry
+ * zone filled on an M15 close. SIGNAL_LEVEL_MODEL=zones switches to the zone
+ * model.
+ */
+export function liveLevelModel(): {
+  levelModel: 'zones' | 'atr';
+  entryTrigger: EntryTrigger;
+} {
+  return process.env.SIGNAL_LEVEL_MODEL === 'zones'
+    ? { levelModel: 'zones', entryTrigger: 'M15_CLOSE' }
+    : { levelModel: 'atr', entryTrigger: 'M15_CLOSE' };
+}
+
 async function liveIntradayPredictions(
   now: Date,
   window: TradingWindow,
@@ -713,6 +948,7 @@ async function liveIntradayPredictions(
           windowEnd: window.end,
           strict: window.strict,
           requireH1Aligned: rearmAfter === 'stopped',
+          ...liveLevelModel(),
         }
       );
       if (!signal) {
@@ -725,6 +961,7 @@ async function liveIntradayPredictions(
         mtfContext: {
           pairCode: pair,
           price: signal.price,
+          zone: signal.zone,
           confluence: signal.confluence,
           session: window.label,
           killzoneHint: info.playbookHint,
@@ -762,7 +999,7 @@ async function liveIntradayPredictions(
       signal,
       now,
       ai ? 'DEEPSEEK' : 'RULE_BASED',
-      ai ? modelName : ENGINE_MODEL,
+      ai ? modelName : ENGINE_MODEL[signal.levelModel],
       ai
     );
   });
@@ -773,7 +1010,27 @@ interface Settlement {
   resolvedPrice: number | null;
   movementPips: number | null;
   note: string;
+  /** Set when it ended without a position (or was cancelled). */
+  reasonCode?: ReasonCode | null;
+  /** The engine's entry, when it filled. */
+  fillPrice?: number | null;
+  filledAt?: Date | null;
 }
+
+/** Settlement notes for a signal that never became a position. */
+const NO_POSITION_NOTE: Partial<Record<ReasonCode, string>> = {
+  NO_TOUCH: 'Price never traded into the entry zone — no position was taken.',
+  NO_CONFIRMATION:
+    'No confirmed entry — price reached the zone but no M15 candle closed in the trade direction, so no position was taken.',
+  CONFIRMATION_EXPIRED:
+    'No confirmed entry — each touch of the zone went stale before an M15 candle confirmed, so no position was taken.',
+  NEWS_BLACKOUT:
+    'No entry — the confirmation came inside a high-impact news window, so no position was taken.',
+  STOP_BEFORE_ENTRY:
+    'No entry — the invalidation level traded before any confirmation, so the setup failed.',
+  MOVED_AWAY:
+    'No entry — price reached TP1 before a confirmation; the move is not chased.',
+};
 
 const CANDLE_MS: Partial<Record<Timeframe, number>> = {
   M15: 15 * 60_000,
@@ -790,7 +1047,15 @@ interface LevelRow {
   invalidationPrice: number;
   /** TP3. Set on managed trades (three targets); absent on older signals. */
   target3Price?: number | null;
+  /** How the entry fills; absent (older signals, users' own trades) = TOUCH. */
+  entryTrigger?: EntryTrigger | null;
+  /** M15_CLOSE: no entry may fill inside these (high-impact news). */
+  blackouts?: Blackout[] | null;
 }
+
+/** M15_CLOSE: a confirmation must come within this many candles of a candle in the zone. */
+export const CONFIRM_WINDOW_BARS = 4;
+
 
 export interface PathReplay {
   /**
@@ -799,13 +1064,18 @@ export interface PathReplay {
    * stopped: the original stop.
    */
   state: 'neutral' | 'waiting' | 'running' | 'target' | 'stopped';
-  /** Start of the candle where the entry zone first traded (ms). */
+  /**
+   * Start of the candle that filled the entry (ms): the first candle in the
+   * zone (TOUCH) or the confirming candle (M15_CLOSE).
+   */
   filledAt: number | null;
+  /** Fill price: the zone midpoint (TOUCH) or the confirming close (M15_CLOSE). */
+  fillPrice: number | null;
   /** Start of the candle where the trade closed (ms). */
   closedAt: number | null;
   lastClose: number | null;
   /**
-   * Signed pips for the whole position from the zone midpoint: at the exit
+   * Signed pips for the whole position from the fill price: at the exit
    * when decided, at the last close while running. A managed trade books a
    * third at each target, so its pips blend the thirds.
    */
@@ -817,6 +1087,59 @@ export interface PathReplay {
   tp2At: number | null;
   /** Where the stop is now: original → entry after TP1 → TP1 after TP2. */
   stopNow: number | null;
+  /** Start of the first candle that traded into the entry zone (ms). */
+  touchedAt: number | null;
+  /** M15_CLOSE: the setup died before an entry (no later fill is possible). */
+  voidReason: 'STOP_BEFORE_ENTRY' | 'MOVED_AWAY' | null;
+  /** M15_CLOSE: start of the first candle that confirmed inside a news window (ms). */
+  newsBlockedAt: number | null;
+  /** M15_CLOSE: touches that went stale without a confirmation. */
+  expiredTouches: number;
+  /** Waiting, with price recently in the zone: an M15 close would fill now. */
+  awaitingConfirmation: boolean;
+}
+
+/** The lifecycle stage a replayed path is at. */
+export function lifecycleStage(path: PathReplay): LifecycleStage {
+  switch (path.state) {
+    case 'neutral':
+      return 'STAND_ASIDE';
+    case 'waiting':
+      return path.voidReason
+        ? 'VOID'
+        : path.awaitingConfirmation
+          ? 'IN_ZONE'
+          : 'WAITING_FOR_ZONE';
+    case 'running':
+      return path.tpHits >= 2 ? 'TP2' : path.tpHits === 1 ? 'TP1' : 'ENTERED';
+    default:
+      return 'CLOSED';
+  }
+}
+
+/** Why a path that never filled produced no position. */
+export function noPositionReason(path: PathReplay): ReasonCode {
+  if (path.voidReason) return path.voidReason;
+  if (path.newsBlockedAt !== null) return 'NEWS_BLACKOUT';
+  if (path.touchedAt === null) return 'NO_TOUCH';
+  return path.expiredTouches > 0 ? 'CONFIRMATION_EXPIRED' : 'NO_CONFIRMATION';
+}
+
+/** "Approaching the zone" alert distance. */
+const APPROACH_PIPS = 5;
+
+/** Pips from a price to the nearest edge of the entry zone (0 inside it). */
+export function distanceToZonePips(
+  p: { pairCode: string; entryLow: number; entryHigh: number },
+  price: number
+): number {
+  const gap =
+    price > p.entryHigh
+      ? price - p.entryHigh
+      : price < p.entryLow
+        ? p.entryLow - price
+        : 0;
+  return gap / pipSize(p.pairCode as PairCode);
 }
 
 /** TP1 of a managed trade: +1R from the zone midpoint. */
@@ -832,16 +1155,18 @@ export function firstTarget(row: {
 /**
  * Replays a signal's levels against candles (oldest first), the way a trader
  * would have experienced them:
- * - the position only exists once price trades into the entry zone (filled at
- *   the zone midpoint);
+ * - the position only exists once price trades into the entry zone: filled at
+ *   the zone midpoint (TOUCH), or at the close of the first candle that then
+ *   confirms in the trade direction (M15_CLOSE — see EntryTrigger);
  * - after the fill, whichever of stop or target is touched first decides the
  *   result; when both fall inside one candle the stop is assumed first;
  * - NEUTRAL calls are a stand-aside, not a trade.
  * Managed trades (with a TP3) take a third off at each target and trail the
  * stop: to the entry after TP1, to TP1 after TP2. A new stop applies from the
  * next candle (inside one candle the order of high and low is unknown).
- * Result for the whole position: −1R at the stop, +⅓R after TP1, +1⅓R after
- * TP2, +2R at TP3 (with TP1/TP2/TP3 at 1R/2R/3R).
+ * Result for the whole position (TOUCH fills): −1R at the stop, +⅓R after
+ * TP1, +1⅓R after TP2, +2R at TP3 (with TP1/TP2/TP3 at 1R/2R/3R). A confirmed
+ * fill is rarely the midpoint, so its pips are measured from the real fill.
  * Used both to settle expired signals and to show live progress, so the two
  * can never disagree.
  */
@@ -851,6 +1176,12 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
     candles.length > 0 ? candles[candles.length - 1].close : null;
   const base = {
     filledAt: null,
+    fillPrice: null,
+    touchedAt: null,
+    voidReason: null,
+    newsBlockedAt: null,
+    expiredTouches: 0,
+    awaitingConfirmation: false,
     closedAt: null,
     lastClose,
     pips: null,
@@ -862,7 +1193,8 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
   if (row.direction === 'NEUTRAL') return { ...base, state: 'neutral' };
 
   const isLong = row.direction === 'LONG';
-  const fill = (row.entryLow + row.entryHigh) / 2;
+  const confirm = row.entryTrigger === 'M15_CLOSE';
+  let fill = (row.entryLow + row.entryHigh) / 2;
   const signed = (price: number) =>
     (isLong ? price - fill : fill - price) / pipSize(pair);
   const round = (pips: number) => Number(pips.toFixed(1));
@@ -893,6 +1225,12 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
   ): PathReplay => ({
     state,
     filledAt,
+    fillPrice: filledAt === null ? null : fill,
+    touchedAt,
+    voidReason: null,
+    newsBlockedAt,
+    expiredTouches,
+    awaitingConfirmation: false,
     closedAt: at,
     lastClose,
     pips: pips === null ? null : round(pips),
@@ -902,11 +1240,67 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
     stopNow,
   });
 
+  // M15_CLOSE: a confirming close may sit a little past the zone, not beyond
+  // half its width (a close that ran further is a chase, not an entry).
+  const halfZone = (row.entryHigh - row.entryLow) / 2;
+  const tp1 = firstTarget(row);
+  const blackouts = confirm ? (row.blackouts ?? []) : [];
+  let touched = false;
+  let sinceTouch = 0;
+  let touchedAt: number | null = null;
+  let newsBlockedAt: number | null = null;
+  let expiredTouches = 0;
+  let voidReason: PathReplay['voidReason'] = null;
   for (const candle of candles) {
     const t = candleTime(candle);
     if (filledAt === null) {
-      if (candle.low > row.entryHigh || candle.high < row.entryLow) continue;
-      filledAt = t;
+      const inZone = candle.low <= row.entryHigh && candle.high >= row.entryLow;
+      if (inZone) {
+        touched = true;
+        sinceTouch = 0;
+        touchedAt ??= t;
+      } else if (touched && confirm) {
+        // A confirmation long after price left the zone is stale: price
+        // must come back to the zone first.
+        sinceTouch += 1;
+        if (sinceTouch > CONFIRM_WINDOW_BARS) {
+          touched = false;
+          expiredTouches += 1;
+        }
+      }
+      if (!touched) continue;
+      if (!confirm) {
+        filledAt = t;
+      } else {
+        // The stop traded before any confirmation: the setup failed, no entry.
+        if (below(candle, stop)) {
+          voidReason = 'STOP_BEFORE_ENTRY';
+          break;
+        }
+        // The move left without us (TP1 traded before an entry): no chase.
+        if (above(candle, tp1)) {
+          voidReason = 'MOVED_AWAY';
+          break;
+        }
+        const blocked = blackouts.some(
+          (b) => t < b.to && t + 15 * 60_000 > b.from
+        );
+        const confirms = isLong
+          ? candle.close > candle.open &&
+            candle.close >= row.entryLow &&
+            candle.close <= row.entryHigh + halfZone
+          : candle.close < candle.open &&
+            candle.close <= row.entryHigh &&
+            candle.close >= row.entryLow - halfZone;
+        // Filled at the close: stop and targets apply from the next candle.
+        // No entry into a high-impact release.
+        if (confirms && blocked) newsBlockedAt ??= t;
+        else if (confirms) {
+          filledAt = t;
+          fill = candle.close;
+        }
+        continue;
+      }
     }
     // A stop trailed on an earlier candle protects this one.
     if (nextStop !== null) {
@@ -933,7 +1327,16 @@ export function replayPath(row: LevelRow, candles: Candle[]): PathReplay {
     }
     if (tpHits === targets.length) return result('target', t, booked, null);
   }
-  if (filledAt === null) return { ...base, state: 'waiting' };
+  if (filledAt === null)
+    return {
+      ...base,
+      state: 'waiting',
+      touchedAt,
+      voidReason,
+      newsBlockedAt,
+      expiredTouches,
+      awaitingConfirmation: touched && voidReason === null,
+    };
   const remaining = 1 - tpHits * share;
   return result(
     'running',
@@ -966,7 +1369,7 @@ async function liveProgress(
   const path = replayPath(p, candles);
   // Progress follows the price (not the blended pips): toward the final
   // target on the way up, toward the stop on the way down.
-  const mid = (p.entryLow + p.entryHigh) / 2;
+  const mid = path.fillPrice ?? (p.entryLow + p.entryHigh) / 2;
   const priceMove =
     path.state === 'running' && path.lastClose !== null
       ? (p.direction === 'LONG' ? path.lastClose - mid : mid - path.lastClose) /
@@ -992,6 +1395,12 @@ async function liveProgress(
               : null;
   const iso = (ms: number | null) => (ms ? new Date(ms).toISOString() : null);
   return {
+    stage: lifecycleStage(path),
+    touchedAt: iso(path.touchedAt),
+    fillPrice: path.fillPrice,
+    voidReason: path.voidReason,
+    newsBlockedAt: iso(path.newsBlockedAt),
+    expiredTouches: path.expiredTouches,
     state: path.state,
     filledAt: iso(path.filledAt),
     closedAt: iso(path.closedAt),
@@ -1032,6 +1441,19 @@ export function settleFromPath(
   path: PathReplay,
   after = false
 ): Settlement {
+  const fill = {
+    fillPrice: path.fillPrice,
+    filledAt: path.filledAt === null ? null : new Date(path.filledAt),
+  };
+  const settled = settleState(row, path, after);
+  return path.filledAt === null ? settled : { ...settled, ...fill };
+}
+
+function settleState(
+  row: LevelRow,
+  path: PathReplay,
+  after: boolean
+): Settlement {
   const followed = after
     ? ' after the window closed (the trade was followed until target or stop)'
     : '';
@@ -1059,7 +1481,7 @@ export function settleFromPath(
           ? row.target3Price!
           : path.tpHits === 2
             ? firstTarget(row)
-            : (row.entryLow + row.entryHigh) / 2;
+            : (path.fillPrice ?? (row.entryLow + row.entryHigh) / 2);
       return {
         status: 'HIT',
         resolvedPrice: lastExit,
@@ -1067,13 +1489,17 @@ export function settleFromPath(
         note: targetNote(path, managed, after),
       };
     }
-    case 'waiting':
+    case 'waiting': {
+      const reasonCode =
+        row.entryTrigger === 'M15_CLOSE' ? noPositionReason(path) : 'NO_TOUCH';
       return {
         status: 'EXPIRED',
         resolvedPrice: path.lastClose,
         movementPips: null,
-        note: 'Price never traded into the entry zone — no position was taken.',
+        note: NO_POSITION_NOTE[reasonCode] ?? NO_POSITION_NOTE.NO_TOUCH!,
+        reasonCode,
       };
+    }
     default:
       return {
         status: 'EXPIRED',
@@ -1236,6 +1662,8 @@ export async function evaluateExpiredPredictions(
       targetPrice: Number(row.targetPrice),
       target3Price: row.target3Price === null ? null : Number(row.target3Price),
       invalidationPrice: Number(row.invalidationPrice),
+      entryTrigger: row.entryTrigger === 'M15_CLOSE' ? 'M15_CLOSE' : 'TOUCH',
+      blackouts: blackoutsFromJson(row.noEntryWindows),
     };
 
     // A hold call manages an earlier open trade; it is never a trade itself.
@@ -1305,6 +1733,8 @@ export async function evaluateExpiredPredictions(
         resolvedPrice: path.lastClose,
         movementPips: path.pips,
         note: 'Still open at the Friday close — closed there and marked to the last price.',
+        fillPrice: path.fillPrice,
+        filledAt: path.filledAt === null ? null : new Date(path.filledAt),
       });
       continue;
     }
@@ -1315,6 +1745,8 @@ export async function evaluateExpiredPredictions(
       resolvedPrice: null,
       movementPips: path.pips,
       note: OPEN_TRADE_NOTE,
+      fillPrice: path.fillPrice,
+      filledAt: path.filledAt === null ? null : new Date(path.filledAt),
     });
   }
   return openPairs;
@@ -1395,6 +1827,8 @@ async function carriedThisWindow(predictionId: string, windowKey: string) {
 export interface ManageDecision {
   action: 'none' | 'cancel' | 'exit';
   reason: string;
+  /** Cancellations only. */
+  code?: 'H1_INVALIDATION' | 'CONTEXT_FLIP' | 'H1_TURNED';
 }
 
 const AGAINST = 15;
@@ -1425,16 +1859,19 @@ export function decideOnH1Close(input: {
     if (beyondStop)
       return {
         action: 'cancel',
+        code: 'H1_INVALIDATION',
         reason: `Cancelled before entry: H1 closed ${long ? 'below' : 'above'} the invalidation level without the zone filling.`,
       };
     if (contextAgainst)
       return {
         action: 'cancel',
+        code: 'CONTEXT_FLIP',
         reason: `Cancelled before entry: the daily/H4 context turned ${against}.`,
       };
     if (h1Against)
       return {
         action: 'cancel',
+        code: 'H1_TURNED',
         reason: `Cancelled before entry: H1 turned ${against} against the context. Waiting for a clearer sign.`,
       };
     return { action: 'none', reason: '' };
@@ -1557,7 +1994,7 @@ export async function manageOnH1Close(now = new Date()) {
       });
       if (decision.action === 'none') continue;
 
-      const mid = (p.entryLow + p.entryHigh) / 2;
+      const mid = path.fillPrice ?? (p.entryLow + p.entryHigh) / 2;
       const pips = Number(
         (
           (p.direction === 'LONG' ? last.close - mid : mid - last.close) /
@@ -1574,6 +2011,7 @@ export async function manageOnH1Close(now = new Date()) {
             evaluatedAt: now,
             source: 'LIVE' as PrismaOutcomeSource,
             note: decision.reason,
+            reasonCode: decision.code ?? null,
           },
         });
         console.info(`${pair} #${row.id}: ${decision.reason}`);
@@ -1650,6 +2088,12 @@ export async function getCurrentPredictions(
 /** Announces a newly published trade (holds and stand-asides are not alerted). */
 async function announceNew(row: DbPrediction) {
   const p = fromRow(row);
+  if (p.reasonCode === 'DAILY_LOSS_LIMIT') {
+    await announceSignalEvent('TRADING_PAUSED', p, {
+      note: p.factors[0] ?? null,
+    }).catch(() => undefined);
+    return;
+  }
   if (p.direction === 'NEUTRAL' || p.continuesId) return;
   await announceSignalEvent('SIGNAL_NEW', p).catch((error) =>
     console.warn(
@@ -1707,6 +2151,108 @@ function nextH1Close(closedAt: string): Date {
  * Free-tier friendly: stored signals are reused until they expire; failed
  * first-generation attempts back off for 15 minutes (`force` bypasses it).
  */
+/** A published call turned into a stand-aside, with the reason first. */
+function standAside(
+  signal: PublishedPrediction,
+  reason: string,
+  reasonCode: ReasonCode
+): PublishedPrediction {
+  return {
+    ...signal,
+    direction: 'NEUTRAL',
+    reasonCode,
+    confidence: Math.min(signal.confidence, 45),
+    target1Price: null,
+    target3Price: null,
+    blackouts: [],
+    rationale: `${reason} ${signal.rationale}`.slice(0, 600),
+    factors: [reason, ...signal.factors].slice(0, 5),
+    playbook: `${signal.session}: stand aside. ${reason}`.slice(0, 600),
+  };
+}
+
+/** Closed R so far today (UTC) across both pairs, from stored and live results. */
+async function realizedRToday(now: Date): Promise<number> {
+  const dayStart = new Date(now);
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const rows = await prisma.prediction.findMany({
+    where: {
+      validFrom: { gte: dayStart, lte: now },
+      direction: { not: 'NEUTRAL' },
+      continuesId: null,
+    },
+    include: { outcome: true },
+  });
+  let total = 0;
+  for (const row of rows) {
+    const p = fromRow(row);
+    if (!p.stopPips) continue;
+    const status = row.outcome?.status;
+    let pips: number | null = null;
+    if (status && status !== 'PENDING' && status !== 'CANCELLED')
+      pips = row.outcome?.movementPips == null ? null : Number(row.outcome.movementPips);
+    else {
+      const live = await liveProgress(p).catch(() => null);
+      if (live && (live.state === 'stopped' || live.state === 'target')) pips = live.pips;
+    }
+    if (pips !== null) total += pips / p.stopPips;
+  }
+  return total;
+}
+
+/**
+ * Portfolio rules (risk.ts) on the calls about to be published: no second
+ * trade on the same USD side as one already open or waiting for entry, and
+ * nothing new after the daily loss limit. The higher-confidence call of a
+ * clashing pair in the same batch goes first.
+ */
+async function applyPortfolioRules(
+  signals: PublishedPrediction[],
+  now: Date
+): Promise<PublishedPrediction[]> {
+  if (!signals.some((s) => s.direction !== 'NEUTRAL')) return signals;
+  const exposures: Exposure[] = [];
+  const candidates = await prisma.prediction.findMany({
+    where: {
+      direction: { not: 'NEUTRAL' },
+      continuesId: null,
+      validFrom: { lte: now },
+      outcome: { status: 'PENDING' },
+    },
+    include: { outcome: true },
+  });
+  for (const row of candidates) {
+    const live = await liveProgress(fromRow(row), now).catch(() => null);
+    const waiting = row.expiresAt > now && (!live || live.state === 'waiting');
+    if (waiting || live?.state === 'running')
+      exposures.push({ pairCode: row.pairCode as PairCode, direction: row.direction as Direction });
+  }
+  const lost = await realizedRToday(now).catch(() => 0);
+  const ordered = [...signals].sort((a, b) => b.confidence - a.confidence);
+  const out = new Map<string, PublishedPrediction>();
+  for (const signal of ordered) {
+    // Execution: an abnormally wide live spread (when a terminal reports one).
+    const spread = await liveSpread(signal.pairCode, now).catch(() => null);
+    if (signal.meta) signal.meta.features.spreadPips = spread?.spreadPips ?? null;
+    if (signal.direction !== 'NEUTRAL' && spread?.wide) {
+      const reason = `Live spread ${spread.spreadPips} pips is above the ${MAX_SPREAD_PIPS[signal.pairCode]}-pip limit — no entry at this cost.`;
+      console.info(`${signal.pairCode}: ${reason}`);
+      out.set(signal.pairCode, standAside(signal, reason, 'WIDE_SPREAD'));
+      continue;
+    }
+    const block = portfolioBlock(signal, exposures, lost);
+    if (block) {
+      console.info(`${signal.pairCode}: ${block.reason}`);
+      out.set(signal.pairCode, standAside(signal, block.reason, block.code));
+      continue;
+    }
+    if (signal.direction !== 'NEUTRAL')
+      exposures.push({ pairCode: signal.pairCode, direction: signal.direction });
+    out.set(signal.pairCode, signal);
+  }
+  return signals.map((s) => out.get(s.pairCode) ?? s);
+}
+
 export async function getOrCreatePredictions(
   now = new Date(),
   options?: { force?: boolean }
@@ -1818,7 +2364,7 @@ export async function getOrCreatePredictions(
         `${signal.pairCode}: ${window.label} analysis ${decision.reconfirmed ? 're-confirmed' : 'is neutral on'} the open trade #${decision.prior.id}; carried, nothing new published.`
       );
     }
-    signals = published;
+    signals = await applyPortfolioRules(signals, now);
   } catch (error) {
     console.warn(
       'Intraday generation unavailable; keeping the stored signals.',
@@ -2000,14 +2546,34 @@ function buildDeterministicOutlook(
   const swingHighs = views
     .map((v) => v.swingHigh)
     .filter((n): n is number => n !== null);
-  const supports = [...new Set(swingLows.map((n) => roundToPip(pair, n)))]
-    .filter((n) => n < price)
-    .sort((a, b) => b - a)
-    .slice(0, 3);
-  const resistances = [...new Set(swingHighs.map((n) => roundToPip(pair, n)))]
-    .filter((n) => n > price)
-    .sort((a, b) => a - b)
-    .slice(0, 3);
+  // Levels: the nearest higher-timeframe zones (previous day/week, Daily/H4
+  // pivots and demand/supply) — the same map the intraday engine trades
+  // from; the timeframe range extremes only fill in when there are none.
+  const zones = buildZoneMap(pair, mtf, price, Date.now(), {
+    orderBlocks: false,
+  }).zones.filter((z) => z.higherTimeframe);
+  const mids = (list: typeof zones) =>
+    list.map((z) => roundToPip(pair, (z.low + z.high) / 2));
+  const zoneSupports = mids(
+    zones.filter((z) => z.high < price).sort((a, b) => b.high - a.high)
+  ).slice(0, 3);
+  const zoneResistances = mids(
+    zones.filter((z) => z.low > price).sort((a, b) => a.low - b.low)
+  ).slice(0, 3);
+  const supports =
+    zoneSupports.length > 0
+      ? zoneSupports
+      : [...new Set(swingLows.map((n) => roundToPip(pair, n)))]
+          .filter((n) => n < price)
+          .sort((a, b) => b - a)
+          .slice(0, 3);
+  const resistances =
+    zoneResistances.length > 0
+      ? zoneResistances
+      : [...new Set(swingHighs.map((n) => roundToPip(pair, n)))]
+          .filter((n) => n > price)
+          .sort((a, b) => a - b)
+          .slice(0, 3);
 
   const res1 = resistances[0] ?? price + atrP * pipSize(pair) * 2;
   const sup1 = supports[0] ?? price - atrP * pipSize(pair) * 2;
@@ -2436,7 +3002,7 @@ async function trackOnM15Close(now: Date) {
     const candles = await closedSeries(p.pairCode, row.validFrom);
     if (!candles) continue;
     const path = replayPath(p, candles);
-    if (path.state === 'waiting' || path.state === 'neutral') continue;
+    if (path.state === 'neutral') continue;
     // Old news (e.g. the first run after a deploy) is logged, not alerted.
     const stale = (at: number | null) =>
       at !== null && now.getTime() - at > STALE_ALERT_MS;
@@ -2448,9 +3014,31 @@ async function trackOnM15Close(now: Date) {
       announceSignalEvent(kind, p, extra, { silent: stale(at) }).catch(
         () => undefined
       );
+    if (path.state === 'waiting') {
+      // Before entry: approach, touch, and the ways a setup can die.
+      const lastAt = candleTime(candles[candles.length - 1]);
+      if (path.voidReason) {
+        await announce('SETUP_VOID', lastAt, { note: path.voidReason });
+        continue;
+      }
+      if (row.expiresAt <= now) continue;
+      if (path.newsBlockedAt !== null)
+        await announce('ENTRY_BLOCKED_NEWS', path.newsBlockedAt);
+      if (path.expiredTouches > 0)
+        await announce('CONFIRMATION_EXPIRED', lastAt);
+      if (path.awaitingConfirmation && path.touchedAt !== null)
+        await announce('ZONE_TOUCHED', path.touchedAt);
+      else if (
+        path.touchedAt === null &&
+        path.lastClose !== null &&
+        distanceToZonePips(p, path.lastClose) <= APPROACH_PIPS
+      )
+        await announce('APPROACHING_ZONE', lastAt, { price: path.lastClose });
+      continue;
+    }
     // Every step, in order, so a fast move still reads as a story.
     const managed = p.target3Price !== null;
-    await announce('ENTRY_FILLED', path.filledAt);
+    await announce('ENTRY_FILLED', path.filledAt, { price: path.fillPrice });
     if (managed && path.tpHits >= 1) await announce('TP1_HIT', path.tp1At);
     if (managed && path.tpHits >= 2) await announce('TP2_HIT', path.tp2At);
     if (path.state === 'stopped')
@@ -2571,6 +3159,7 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
       error instanceof Error ? error.message : error
     );
   }
+  await pruneSpreadSamples(now).catch(() => undefined);
 }
 
 /**

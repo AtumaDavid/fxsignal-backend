@@ -19,6 +19,9 @@ export interface Mt5Position {
   closePrice?: number;
   closeTime?: number;
   profit?: number;
+  /** Account currency, from the broker's deals (EA 1.1+). */
+  commission?: number;
+  swap?: number;
 }
 
 /** Broker symbol → FXSignal pair: "EURUSDm", "EURUSD.raw", "EUR/USD" → "EUR/USD". */
@@ -78,9 +81,17 @@ export interface JournalFill {
   openedAt: Date;
   exitedAt: Date | null;
   externalRef: string;
+  /** Summed over the positions; null when the EA did not report them. */
+  commission: number | null;
+  swap: number | null;
 }
 
 const EPS = 1e-6;
+
+function sumReported(values: (number | undefined)[]): number | null {
+  const known = values.filter((v): v is number => typeof v === 'number');
+  return known.length ? Number(known.reduce((a, b) => a + b, 0).toFixed(2)) : null;
+}
 
 /**
  * Several positions on one signal (e.g. one per take-profit) become one
@@ -130,5 +141,7 @@ export function aggregatePositions(positions: Mt5Position[]): JournalFill {
       .map((p) => p.id)
       .sort()
       .join(','),
+    commission: sumReported(positions.map((p) => p.commission)),
+    swap: sumReported(positions.map((p) => p.swap)),
   };
 }

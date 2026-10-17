@@ -1,47 +1,46 @@
 import { Router } from 'express';
-import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
+import { mt5Drawdown, readRiskPrefs, riskPrefsSchema } from '../lib/riskPrefs.js';
 
 /**
- * Risk guardrails: a daily loss limit (% of the account) and a maximum number
- * of trades per day, checked against the user's journal. Off by default; the
- * app only warns, it never blocks a trade.
+ * Risk guardrails, checked against the user's journal (and the MT5 account
+ * snapshot when the Sync EA runs): daily and weekly loss limits, trades per
+ * day, open positions, per-currency exposure, risk per trade and a drawdown
+ * pause. Off by default. The app warns and never blocks a trade; past the
+ * drawdown limit it also stops sending that user new-signal alerts.
  */
 const router = Router();
 
-export const riskPrefsSchema = z.object({
-  enabled: z.boolean(),
-  dailyLossPct: z.number().min(0.1).max(50).nullable(),
-  maxTradesPerDay: z.number().int().min(1).max(50).nullable(),
-  balance: z.number().positive().max(1e12).nullable(),
-  currency: z.enum(['USD', 'EUR', 'JPY']),
-});
-
-export type RiskPrefs = z.infer<typeof riskPrefsSchema>;
-
-export const DEFAULT_RISK_PREFS: RiskPrefs = {
-  enabled: false,
-  dailyLossPct: 3,
-  maxTradesPerDay: 3,
-  balance: null,
-  currency: 'USD',
-};
-
-export function readRiskPrefs(value: unknown): RiskPrefs {
-  const parsed = riskPrefsSchema.partial().safeParse(value ?? {});
-  return { ...DEFAULT_RISK_PREFS, ...(parsed.success ? parsed.data : {}) };
-}
+export {
+  DEFAULT_RISK_PREFS,
+  mt5Drawdown,
+  readRiskPrefs,
+  riskPrefsSchema,
+  type RiskPrefs,
+} from '../lib/riskPrefs.js';
 
 router.get(
   '/',
   asyncRoute(async (req, res) => {
-    const user = await prisma.user.findUnique({
-      where: { id: Number(req.user?.sub) },
-      select: { riskPrefs: true },
+    const userId = Number(req.user?.sub);
+    const [user, link] = await Promise.all([
+      prisma.user.findUnique({ where: { id: userId }, select: { riskPrefs: true } }),
+      prisma.mt5Link.findUnique({ where: { userId } }),
+    ]);
+    const prefs = readRiskPrefs(user?.riskPrefs);
+    res.json({
+      prefs,
+      mt5: link
+        ? {
+            ...mt5Drawdown(prefs, link),
+            currency: link.lastCurrency,
+            balance: link.lastBalance === null ? null : Number(link.lastBalance),
+            syncedAt: link.lastSyncAt?.toISOString() ?? null,
+          }
+        : null,
     });
-    res.json({ prefs: readRiskPrefs(user?.riskPrefs) });
   })
 );
 

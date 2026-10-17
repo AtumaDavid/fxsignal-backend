@@ -3,6 +3,15 @@ import webpush from 'web-push';
 import { Prisma } from '@prisma/client';
 import { prisma } from './prisma.js';
 import type { Prediction } from './model.js';
+import { mt5Drawdown, readRiskPrefs } from './riskPrefs.js';
+import {
+  readAlertTargets,
+  sendDiscord,
+  sendTelegram,
+  sendWebhook,
+  telegramConfigured,
+  type ExternalAlert,
+} from './externalAlerts.js';
 
 /**
  * Alerts: every signal event is announced once (SignalEvent is the dedupe
@@ -24,6 +33,12 @@ export type AlertKind =
   | 'TRAIL_STOP_HIT'
   | 'CANCELLED'
   | 'CLOSED_EARLY'
+  | 'APPROACHING_ZONE'
+  | 'ZONE_TOUCHED'
+  | 'CONFIRMATION_EXPIRED'
+  | 'ENTRY_BLOCKED_NEWS'
+  | 'SETUP_VOID'
+  | 'TRADING_PAUSED'
   | 'MY_TRADE_CLOSED';
 
 /** Groups the user can switch on/off. */
@@ -42,16 +57,30 @@ const GROUP_OF: Record<AlertKind, AlertGroup> = {
   TRAIL_STOP_HIT: 'result',
   CANCELLED: 'checkpoint',
   CLOSED_EARLY: 'checkpoint',
+  // Before entry: "get ready" moments ride with the entry alerts.
+  APPROACHING_ZONE: 'entry',
+  ZONE_TOUCHED: 'entry',
+  CONFIRMATION_EXPIRED: 'checkpoint',
+  ENTRY_BLOCKED_NEWS: 'checkpoint',
+  SETUP_VOID: 'checkpoint',
+  TRADING_PAUSED: 'checkpoint',
   MY_TRADE_CLOSED: 'myTrades',
 };
 
 export interface AlertPrefs {
-  channels: { email: boolean; push: boolean };
+  /** External channels send only once their destination is set up. */
+  channels: {
+    email: boolean;
+    push: boolean;
+    telegram: boolean;
+    discord: boolean;
+    webhook: boolean;
+  };
   events: Record<AlertGroup, boolean>;
 }
 
 export const DEFAULT_ALERT_PREFS: AlertPrefs = {
-  channels: { email: true, push: true },
+  channels: { email: true, push: true, telegram: true, discord: true, webhook: true },
   events: {
     newSignal: true,
     entry: true,
@@ -161,7 +190,7 @@ interface Delivery {
 /** Kept for the admin page; never throws. */
 async function recordFailure(
   userId: number,
-  channel: 'email' | 'push',
+  channel: 'email' | 'push' | 'telegram' | 'discord' | 'webhook',
   kind: string,
   error: unknown
 ) {
@@ -179,7 +208,12 @@ async function recordFailure(
 }
 
 async function deliverTo(
-  user: { id: number; email: string; alertPrefs: Prisma.JsonValue | null },
+  user: {
+    id: number;
+    email: string;
+    alertPrefs: Prisma.JsonValue | null;
+    alertTargets?: Prisma.JsonValue | null;
+  },
   alert: Delivery
 ) {
   const prefs = readAlertPrefs(user.alertPrefs);
@@ -251,14 +285,72 @@ async function deliverTo(
         });
     }
   }
+
+  // Telegram, Discord, webhook: only where the user set a destination.
+  const targets = readAlertTargets(user.alertTargets);
+  const external: ExternalAlert = {
+    kind: alert.kind,
+    title: alert.title,
+    body: alert.body,
+    url: `${APP_URL}${alert.path}`,
+    predictionId: alert.predictionId,
+  };
+  const sends: [AlertChannel, (() => Promise<void>) | null][] = [
+    [
+      'telegram',
+      prefs.channels.telegram && targets.telegramChatId && telegramConfigured()
+        ? () => sendTelegram(targets.telegramChatId!, external)
+        : null,
+    ],
+    [
+      'discord',
+      prefs.channels.discord && targets.discordWebhookUrl
+        ? () => sendDiscord(targets.discordWebhookUrl!, external)
+        : null,
+    ],
+    [
+      'webhook',
+      prefs.channels.webhook && targets.webhookUrl && targets.webhookSecret
+        ? () => sendWebhook(targets.webhookUrl!, targets.webhookSecret!, external)
+        : null,
+    ],
+  ];
+  for (const [channel, send] of sends) {
+    if (!send) continue;
+    await send().catch((error: unknown) => {
+      console.warn(
+        `${channel} alert to user ${user.id} failed.`,
+        error instanceof Error ? error.message : error
+      );
+      void recordFailure(user.id, channel, alert.kind, error);
+    });
+  }
 }
+
+type AlertChannel = 'telegram' | 'discord' | 'webhook';
 
 async function fanOut(alert: Delivery, onlyUserId?: number) {
   const users = await prisma.user.findMany({
     where: onlyUserId ? { id: onlyUserId } : {},
-    select: { id: true, email: true, alertPrefs: true },
+    select: { id: true, email: true, alertPrefs: true, alertTargets: true, riskPrefs: true },
   });
+  const links =
+    alert.kind === 'SIGNAL_NEW'
+      ? new Map(
+          (
+            await prisma.mt5Link.findMany({
+              where: { userId: { in: users.map((u) => u.id) } },
+            })
+          ).map((l) => [l.userId, l])
+        )
+      : new Map();
   for (const user of users) {
+    // Past the user's drawdown limit (MT5 equity): no new-signal prompts.
+    if (
+      alert.kind === 'SIGNAL_NEW' &&
+      mt5Drawdown(readRiskPrefs(user.riskPrefs), links.get(user.id) ?? null)?.paused
+    )
+      continue;
     await deliverTo(user, alert).catch((error) =>
       console.warn(
         `Alert delivery to user ${user.id} failed.`,
@@ -312,7 +404,10 @@ export function composeAlert(
     case 'ENTRY_FILLED':
       return {
         title: `Entry triggered: ${name}`,
-        body: `Price traded into the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Stop ${px(p, p.invalidationPrice)}, ${targets(p)}.`,
+        body:
+          p.entryTrigger === 'M15_CLOSE'
+            ? `An M15 candle confirmed inside the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}${extra.price ? `; filled at ${px(p, extra.price)}` : ''}. Stop ${px(p, p.invalidationPrice)}, ${targets(p)}.`
+            : `Price traded into the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Stop ${px(p, p.invalidationPrice)}, ${targets(p)}.`,
       };
     case 'TP1_HIT':
       return {
@@ -350,6 +445,39 @@ export function composeAlert(
         body:
           noteBody(extra.note) ??
           'The setup broke on an H1 close before the entry zone filled.',
+      };
+    case 'APPROACHING_ZONE':
+      return {
+        title: `Approaching the zone: ${name}`,
+        body: `${p.pairCode} is at ${px(p, extra.price)}, within a few pips of the entry zone ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Entry needs an M15 close in the trade direction inside the zone.`,
+      };
+    case 'ZONE_TOUCHED':
+      return {
+        title: `In the zone: ${name} — waiting for M15 confirmation`,
+        body: `Price traded into ${px(p, p.entryLow)}–${px(p, p.entryHigh)}. Enter only after an M15 candle closes ${p.direction === 'LONG' ? 'bullish' : 'bearish'} inside the zone; stop ${px(p, p.invalidationPrice)}.`,
+      };
+    case 'CONFIRMATION_EXPIRED':
+      return {
+        title: `Confirmation expired: ${name}`,
+        body: `Price left the entry zone without an M15 confirmation. The setup stays valid only if price returns to ${px(p, p.entryLow)}–${px(p, p.entryHigh)}.`,
+      };
+    case 'ENTRY_BLOCKED_NEWS':
+      return {
+        title: `Entry blocked by news: ${name}`,
+        body: `A confirmation formed inside a high-impact news window, so no entry was taken. Entries resume after the window if price is still in the zone.`,
+      };
+    case 'SETUP_VOID':
+      return {
+        title: `Setup void: ${name}`,
+        body:
+          extra.note === 'MOVED_AWAY'
+            ? `Price reached TP1 ${px(p, p.target1Price)} before any confirmation. The move is not chased — no entry.`
+            : `The invalidation level ${px(p, p.invalidationPrice)} traded before any confirmation. No entry.`,
+      };
+    case 'TRADING_PAUSED':
+      return {
+        title: 'Trading paused for today',
+        body: `${extra.note ?? 'The daily loss limit was reached.'} New signals resume tomorrow (UTC).`,
       };
     case 'CLOSED_EARLY':
       return {

@@ -8,6 +8,7 @@ import cors from 'cors';
 import { bootstrapDatabase } from './lib/bootstrap.js';
 import { checkDatabase, prisma } from './lib/prisma.js';
 import { maintainMarketData, onCandleClose } from './lib/predictions.js';
+import { pollTelegram } from './lib/externalAlerts.js';
 import { requireAdmin, requireAuth } from './middleware/auth.js';
 import { rateLimit } from './middleware/rateLimit.js';
 import authRoutes from './routes/auth.routes.js';
@@ -23,6 +24,7 @@ import journalRoutes from './routes/journal.routes.js';
 import notificationsRoutes from './routes/notifications.routes.js';
 import recapRoutes from './routes/recap.routes.js';
 import riskRoutes from './routes/risk.routes.js';
+import executionRoutes from './routes/execution.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import { mt5Router, mt5SyncRouter } from './routes/mt5.routes.js';
 
@@ -97,6 +99,7 @@ app.use('/api/journal', requireAuth, journalRoutes);
 app.use('/api/notifications', requireAuth, notificationsRoutes);
 app.use('/api/recap', requireAuth, recapRoutes);
 app.use('/api/risk', requireAuth, riskRoutes);
+app.use('/api/execution', requireAuth, executionRoutes);
 // Owner console: authenticated + ADMIN_EMAILS allowlist, with its own abuse
 // budget. The admin UI lives on a separate /admin surface (optionally a
 // separate domain via VITE_ADMIN_ONLY=1); this middleware is the real gate.
@@ -178,6 +181,8 @@ async function start() {
         error instanceof Error ? error.message : error
       )
     );
+    // Telegram chat linking (no-op unless TELEGRAM_BOT_TOKEN is set).
+    void pollTelegram();
   }, 60_000);
 
   const server = app.listen(port, () => {

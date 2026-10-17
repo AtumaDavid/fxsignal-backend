@@ -14,7 +14,20 @@ import {
 import { PAIRS, pipSize } from '../lib/market.js';
 import type { PairCode } from '../lib/model.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
-import { backtestRunning, startBacktest } from '../lib/backtest.js';
+import {
+  backtestRunning,
+  cachedHistoryAt,
+  replayAt,
+  startBacktest,
+  type BacktestTrade,
+} from '../lib/backtest.js';
+import {
+  DIMENSIONS,
+  groupStats,
+  MIN_SAMPLE,
+  type ScoredTrade,
+} from '../lib/analytics.js';
+import { EXECUTION_COST_PIPS } from '../lib/risk.js';
 
 /** Owner-only operations view. Mounted behind requireAuth + requireAdmin. */
 const router = Router();
@@ -468,6 +481,7 @@ router.get(
         finishedAt: true,
         summary: true,
         error: true,
+        strategy: true,
       },
     });
     res.json({
@@ -478,8 +492,13 @@ router.get(
           netR?: number;
           winRate?: number | null;
         } | null;
+        const strategy = r.strategy as { version?: string; fingerprint?: string } | null;
         return {
           ...r,
+          strategy:
+            strategy?.version && strategy.fingerprint
+              ? { version: strategy.version, fingerprint: strategy.fingerprint }
+              : null,
           summary: summary
             ? {
                 trades: summary.trades,
@@ -493,8 +512,126 @@ router.get(
   })
 );
 
+const analyticsSchema = z.object({
+  source: z.enum(['live', 'backtest']).default('live'),
+  dimension: z
+    .enum(['pair', 'session', 'direction', 'strategy', 'trigger', 'trend', 'volatility', 'choppy', 'news', 'context', 'confidence'])
+    .default('session'),
+  days: z.coerce.number().int().min(7).max(730).default(180),
+});
+
+/**
+ * Signal-quality analytics: results grouped by one dimension, with sample
+ * size and a 90% bootstrap range for the average R. Live results use the
+ * engine's own fills, minus the assumed spread + slippage; backtest results
+ * come from the newest finished run (already after costs).
+ */
+router.get(
+  '/analytics',
+  asyncRoute(async (req, res) => {
+    const parsed = analyticsSchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'Invalid analytics query.' });
+    const { source, dimension, days } = parsed.data;
+    let trades: ScoredTrade[] = [];
+    let note: string;
+    if (source === 'live') {
+      const rows = await prisma.prediction.findMany({
+        where: {
+          direction: { not: 'NEUTRAL' },
+          continuesId: null,
+          validFrom: { gte: new Date(Date.now() - days * 86_400_000) },
+          outcome: { status: { in: ['HIT', 'MISSED', 'CLOSED_EARLY', 'EXPIRED', 'BREAKEVEN'] } },
+        },
+        include: { outcome: true },
+      });
+      trades = rows.flatMap((row) => {
+        const pips = row.outcome?.movementPips;
+        const stop = row.stopPips === null ? null : Number(row.stopPips);
+        if (pips === null || pips === undefined || !stop) return [];
+        const cost = EXECUTION_COST_PIPS[row.pairCode as PairCode] ?? 0;
+        const strategy = row.strategy as { version?: string; fingerprint?: string } | null;
+        return [
+          {
+            pairCode: row.pairCode,
+            session: row.session,
+            direction: row.direction,
+            r: Number(((Number(pips) - cost) / stop).toFixed(2)),
+            status: row.outcome!.status,
+            closedAt: row.outcome!.evaluatedAt?.toISOString() ?? null,
+            entryTrigger: row.entryTrigger,
+            strategy: strategy?.version ? `${strategy.version} · ${strategy.fingerprint}` : null,
+            features: row.features as ScoredTrade['features'],
+            confidence: row.confidence,
+          },
+        ];
+      });
+      note = `Published signals from the last ${days} days that became positions, in R after the assumed spread + slippage.`;
+    } else {
+      const run = await prisma.backtestRun.findFirst({
+        where: { status: 'DONE' },
+        orderBy: { finishedAt: 'desc' },
+      });
+      const strategy = run?.strategy as { version?: string; fingerprint?: string } | null;
+      const label = strategy?.version ? `${strategy.version} · ${strategy.fingerprint}` : null;
+      const list = (run?.trades ?? []) as unknown as BacktestTrade[];
+      trades = list
+        .filter((t) => t.filled && t.r !== null && ['HIT', 'MISSED', 'CLOSED_EARLY', 'EXPIRED'].includes(t.status))
+        .map((t) => ({
+          pairCode: t.pairCode,
+          session: t.session,
+          direction: t.direction,
+          r: t.r!,
+          status: t.status,
+          closedAt: t.closedAt,
+          entryTrigger: strategy ? 'M15_CLOSE' : null,
+          strategy: label,
+          features: t.features ?? null,
+          confidence: t.confidence,
+        }));
+      note = run
+        ? `Backtest run #${run.id} (${run.months} months, after costs). In-sample: a group that looks good here still needs to hold out of sample.`
+        : 'No finished backtest yet.';
+    }
+    res.json({
+      source,
+      dimension,
+      dimensions: DIMENSIONS,
+      minSample: MIN_SAMPLE,
+      total: trades.length,
+      note,
+      groups: groupStats(trades, dimension),
+    });
+  })
+);
+
+const replaySchema = z.object({
+  pair: z.enum(['EUR/USD', 'USD/JPY']),
+  at: z.coerce.date(),
+  reveal: z.enum(['0', '1']).default('0'),
+});
+
+/**
+ * Research replay: one frame at `at` from the cached backtest history — the
+ * candles closed by then, the call the engine made at that window's start,
+ * and where it stood. `reveal=1` adds the real outcome (looks ahead).
+ */
+router.get(
+  '/replay',
+  asyncRoute(async (req, res) => {
+    const parsed = replaySchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'Choose a pair and a time.' });
+    const { pair, at, reveal } = parsed.data;
+    const history = await cachedHistoryAt(pair, at.getTime());
+    if (!history)
+      return res.status(404).json({
+        error: 'No cached history covers that time. Run a backtest over that period first.',
+      });
+    res.json(replayAt(pair, history, at.getTime(), { reveal: reveal === '1' }));
+  })
+);
+
 const backtestSchema = z.object({
-  months: z.number().int().min(1).max(12).default(6),
+  months: z.number().int().min(1).max(24).default(6),
 });
 
 /** Starts a run in the background (~7 provider credits per pair the first time). */

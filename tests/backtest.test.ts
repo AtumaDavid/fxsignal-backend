@@ -70,7 +70,17 @@ describe('backtest', () => {
     for (const t of run.trades) {
       if (t.pips === null || t.r === null) continue;
       expect(t.r).toBeCloseTo(t.pips / t.stopPips, 1);
-      if (t.status === 'MISSED') expect(t.r).toBeCloseTo(-1, 1);
+      if (t.filled) expect(t.costPips).toBeGreaterThan(0);
+      // Fills on an M15 close (inside the zone or up to half its width past
+      // it), not at the midpoint: a stop-out costs about 1R, never more than
+      // 1R plus the zone width.
+      if (t.status === 'MISSED') {
+        const zonePips = (t.entryHigh - t.entryLow) / 0.0001;
+        expect(t.r).toBeLessThan(0);
+        expect(t.r).toBeGreaterThanOrEqual(
+          -(t.stopPips + zonePips + t.costPips) / t.stopPips - 0.01
+        );
+      }
       if (t.status === 'HIT') expect(t.r).toBeGreaterThan(0);
     }
   });

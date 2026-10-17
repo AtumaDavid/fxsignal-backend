@@ -14,7 +14,8 @@
     "db:init": "prisma db push && tsx prisma/seed.ts",
     "db:resettle": "tsx prisma/resettle.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "backtest:compare": "tsx scripts/backtest-compare.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",

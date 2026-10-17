@@ -46,6 +46,9 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `MARKET_CACHE_FILE` | Optional path for the restart-safe provider cache (default `.cache/market-cache.json`) |
 | `ADMIN_EMAILS` | Comma-separated emails of accounts that can open `/app/admin` |
 | `TWELVE_DATA_CREDITS_PER_DAY` | Daily credit allowance shown on the admin page (default 800, the free plan) |
+| `SIGNAL_LEVEL_MODEL` | `zones` switches live signals to the zone model; default is the ATR entry zone |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME` | Optional Telegram alerts (a free bot from @BotFather); users link from Settings → Alerts |
+| `OANDA_API_TOKEN`, `OANDA_API_URL` | Optional, backtest only: bid/ask history from a free OANDA practice account (default URL `https://api-fxpractice.oanda.com`); use with `HISTORY_SOURCE=oanda npm run backtest:compare` |
 
 ## API
 

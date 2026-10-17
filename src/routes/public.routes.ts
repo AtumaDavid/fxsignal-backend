@@ -54,6 +54,8 @@ router.get('/track-record', async (req, res) => {
         invalidationPrice: row.invalidationPrice,
         status: row.outcome?.status ?? 'PENDING',
         movementPips: row.outcome?.movementPips ?? null,
+        reasonCode: row.outcome?.reasonCode ?? null,
+        strategy: row.strategy,
       })),
     };
     cache.set(days, { at: Date.now(), body });
@@ -89,6 +91,7 @@ router.get(
       finishedAt: run.finishedAt?.toISOString() ?? null,
       summary: run.summary,
       trades: run.trades,
+      strategy: run.strategy,
     });
   })
 );

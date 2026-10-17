@@ -234,6 +234,8 @@ async function callDeepSeek(
 export interface MtfPairContext {
   pairCode: PairCode;
   price: number;
+  /** Zone model: where the engine located the trade (levels are fixed to it). */
+  zone?: { label: string; low: number; high: number; orderBlock: boolean } | null;
   confluence: Confluence;
   session: string;
   killzoneHint: string;
@@ -274,6 +276,7 @@ function compactMtfContext(
     pairs: pairs.map((p) => ({
       pairCode: p.pairCode,
       currentPrice: p.price,
+      tradeZone: p.zone ?? null,
       session: p.session,
       killzoneHint: p.killzoneHint,
       deterministicConfluence: {
@@ -330,7 +333,7 @@ export async function requestIntradayAnalysis(
     {
       role: 'system',
       content:
-        'You are a disciplined FX day-trading desk analyst for EUR/USD and USD/JPY. The trading model is fixed: the DAILY and H4 timeframes set the context (direction); H1 is the execution timeframe (entry zone, stop beyond the recent H1 swing); M15 is confirmation only (it can raise or lower confidence, never set direction). Respect the supplied deterministic confluence, which is computed from real EMA/RSI/ATR/structure on exactly those timeframes. You may keep its direction or downgrade to NEUTRAL (for example when event risk is high); never flip it, and never trade when it is NEUTRAL. Return JSON only with a predictions array (one object per pair). Never promise profits, never invent news; confidence is an integer 15-92 representing signal confidence, not win probability. Levels must be realistic spot FX (EUR/USD pip 0.0001, USD/JPY pip 0.01): entry zone 8-28 pips wide around the current price; stop beyond the recent H1 structure, 12-60 pips from the middle of the zone; target measured from the middle of the zone at AT LEAST 2x the stop distance (reward:risk >= 2.0, never less). Also include a 1-2 sentence session playbook: execute on H1 inside the zone, wait for an M15 close in the trade direction, what invalidates, and when to stand aside.',
+        'You are a disciplined FX day-trading desk analyst for EUR/USD and USD/JPY. The trading model is fixed: the DAILY and H4 timeframes set the context (direction); H1 is the execution timeframe (entry zone, stop beyond the recent H1 swing); M15 is confirmation only (it can raise or lower confidence, never set direction). Respect the supplied deterministic confluence, which is computed from real EMA/RSI/ATR/structure on exactly those timeframes. You may keep its direction or downgrade to NEUTRAL (for example when event risk is high); never flip it, and never trade when it is NEUTRAL. Return JSON only with a predictions array (one object per pair). Never promise profits, never invent news; confidence is an integer 15-92 representing signal confidence, not win probability. When a pair has a tradeZone, the engine has located the trade at that higher-timeframe support/resistance, demand/supply or order-block zone and its levels are fixed: judge whether the location is worth trading (or downgrade to NEUTRAL), and write the rationale and playbook around that zone — the entry fills only after price reaches the zone and an M15 candle closes in the trade direction. Levels must be realistic spot FX (EUR/USD pip 0.0001, USD/JPY pip 0.01): entry zone 8-28 pips wide (at the tradeZone when there is one, otherwise around the current price); stop beyond the recent H1 structure, 12-60 pips from the middle of the zone; target measured from the middle of the zone at AT LEAST 2x the stop distance (reward:risk >= 2.0, never less). Also include a 1-2 sentence session playbook: execute on H1 inside the zone, wait for an M15 close in the trade direction, what invalidates, and when to stand aside.',
     },
     {
       role: 'user',

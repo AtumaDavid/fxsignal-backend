@@ -47,6 +47,8 @@ export function prediction(overrides: Partial<Prediction> = {}): Prediction {
     session: 'London',
     playbook: null,
     timeframeBias: null,
+    entryTrigger: 'TOUCH',
+    blackouts: [],
     stopPips: 20,
     targetPips: 40,
     riskReward: 2,

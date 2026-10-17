@@ -4,7 +4,9 @@ import { prisma } from '../lib/prisma.js';
 import { fromRow } from '../lib/predictions.js';
 import { pipSize } from '../lib/market.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
-import type { PairCode, Prediction } from '../lib/model.js';
+import type { Direction, PairCode, Prediction } from '../lib/model.js';
+import { slippagePips } from '../lib/execution.js';
+import { readRiskPrefs } from '../lib/riskPrefs.js';
 
 const router = Router();
 
@@ -36,6 +38,9 @@ type TradeRow = {
   exitReason: string | null;
   notes: string | null;
   source?: string | null;
+  commission?: unknown;
+  swap?: unknown;
+  spreadPips?: unknown;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -56,10 +61,45 @@ function tradePips(
   return Number((move / pipSize(pair)).toFixed(1));
 }
 
-function toTrade(row: TradeRow, prediction: Prediction) {
+/**
+ * The price the signal itself filled at, for slippage: the engine's stored
+ * fill, else the zone midpoint for touch-filled (older) signals. Null while
+ * a confirmed-entry signal has not filled.
+ */
+function signalFill(prediction: Prediction): number | null {
+  if (prediction.outcome?.fillPrice != null) return prediction.outcome.fillPrice;
+  if (prediction.entryTrigger === 'TOUCH')
+    return (prediction.entryLow + prediction.entryHigh) / 2;
+  return prediction.live?.fillPrice ?? null;
+}
+
+function toTrade(
+  row: TradeRow,
+  prediction: Prediction,
+  /** Round-turn commission per lot from the user's settings, for hand-logged trades. */
+  commissionPerLot: number | null = null
+) {
   const entryPrice = num(row.entryPrice);
   const exitPrice = num(row.exitPrice);
+  const fill = signalFill(prediction);
+  const lots = num(row.lots);
+  const reported = num(row.commission);
+  const estimated =
+    reported === null && row.source !== 'mt5' && commissionPerLot && lots
+      ? -Number((commissionPerLot * lots).toFixed(2))
+      : null;
   return {
+    commission: reported ?? estimated,
+    /** True when the commission comes from the settings, not the broker. */
+    commissionEstimated: estimated !== null,
+    swap: num(row.swap),
+    spreadPips: num(row.spreadPips),
+    signalFillPrice: fill,
+    /** + = a worse entry than the signal's own fill. */
+    slippagePips:
+      entryPrice !== null && fill !== null
+        ? slippagePips(prediction.pairCode, row.side as Direction, fill, entryPrice)
+        : null,
     id: String(row.id),
     predictionId: prediction.id,
     side: row.side as 'LONG' | 'SHORT',
@@ -120,16 +160,54 @@ function breakdown(closed: Trade[], keyOf: (t: Trade) => string) {
     .sort((a, b) => b.netPips - a.netPips);
 }
 
+/**
+ * Execution quality: slippage against the signal's own fill, costs, and the
+ * gap between the user's pips and the engine's on the same closed signals —
+ * so a bad month can be put on the strategy or on the execution.
+ */
+function execution(trades: Trade[]) {
+  const slipped = trades.filter((t) => t.slippagePips !== null);
+  const both = trades.filter(
+    (t) =>
+      t.pips !== null &&
+      t.prediction.outcome?.movementPips !== null &&
+      t.prediction.outcome?.movementPips !== undefined &&
+      t.prediction.outcome.status !== 'PENDING'
+  );
+  const sum = (values: number[]) =>
+    Number(values.reduce((a, b) => a + b, 0).toFixed(2));
+  const userPips = sum(both.map((t) => t.pips!));
+  const enginePips = sum(both.map((t) => t.prediction.outcome!.movementPips!));
+  return {
+    avgSlippagePips: slipped.length
+      ? Number((sum(slipped.map((t) => t.slippagePips!)) / slipped.length).toFixed(2))
+      : null,
+    slippageTrades: slipped.length,
+    commission: sum(trades.map((t) => t.commission ?? 0)),
+    swap: sum(trades.map((t) => t.swap ?? 0)),
+    /** Same closed signals: the user's pips − the engine's. Negative = execution cost. */
+    executionGapPips: both.length ? Number((userPips - enginePips).toFixed(1)) : null,
+    executionGapTrades: both.length,
+  };
+}
+
 router.get(
   '/',
   asyncRoute(async (req, res) => {
-    const rows = await prisma.userTrade.findMany({
-      where: { userId: Number(req.user?.sub) },
-      include: { prediction: { include: { outcome: true } } },
-      orderBy: { prediction: { validFrom: 'desc' } },
-      take: 500,
-    });
-    const trades = rows.map((row) => toTrade(row, fromRow(row.prediction)));
+    const userId = Number(req.user?.sub);
+    const [rows, user] = await Promise.all([
+      prisma.userTrade.findMany({
+        where: { userId },
+        include: { prediction: { include: { outcome: true } } },
+        orderBy: { prediction: { validFrom: 'desc' } },
+        take: 500,
+      }),
+      prisma.user.findUnique({ where: { id: userId }, select: { riskPrefs: true } }),
+    ]);
+    const { commissionPerLot } = readRiskPrefs(user?.riskPrefs);
+    const trades = rows.map((row) =>
+      toTrade(row, fromRow(row.prediction), commissionPerLot)
+    );
 
     // Side by side: the user's pips vs the engine's on the same signals.
     const closed = trades.filter((t) => t.pips !== null);
@@ -154,6 +232,7 @@ router.get(
           engineScored.map((t) => t.prediction.outcome?.movementPips ?? 0)
         ),
         engineScored: engineScored.length,
+        ...execution(trades),
       },
       byPair: breakdown(closed, (t) => t.prediction.pairCode),
       bySession: breakdown(closed, (t) => t.prediction.session),

@@ -7,6 +7,8 @@ export interface Candle {
   high: number;
   low: number;
   close: number;
+  /** Ask − bid at the close (price units), on bid/ask history only. */
+  spread?: number;
 }
 
 export type Timeframe = 'MONTHLY' | 'WEEKLY' | 'DAILY' | 'H4' | 'H1' | 'M15';
@@ -472,7 +474,9 @@ export function buildDayTradeLevels(
   price: number,
   atrValue: number | null,
   swingHigh: number | null,
-  swingLow: number | null
+  swingLow: number | null,
+  /** Round-trip cost; the target is pushed out so 2R holds after it. */
+  costPips = 0
 ): DayTradeLevels {
   const pip = pipSize(pair);
   const atrPips = atrValue !== null ? toPips(pair, atrValue) : 20;
@@ -508,7 +512,10 @@ export function buildDayTradeLevels(
     }
     invalidationPrice = roundToPip(pair, invalidationPrice);
     const risk = Math.abs(mid - invalidationPrice);
-    const rewardDistance = Math.max(risk * MIN_REWARD_RISK, 20 * pip);
+    const rewardDistance = Math.max(
+      risk * MIN_REWARD_RISK + (MIN_REWARD_RISK + 1) * costPips * pip,
+      20 * pip
+    );
     // Round the target outward so rounding can never cost reward.
     const rawTarget = long ? mid + rewardDistance : mid - rewardDistance;
     targetPrice = roundToPip(
@@ -556,7 +563,7 @@ export function enforceMinRewardRisk<
     targetPrice: number;
     invalidationPrice: number;
   },
->(levels: T): T | null {
+>(levels: T, costPips = 0): T | null {
   if (levels.direction === 'NEUTRAL') return levels;
   const pair = levels.pairCode;
   const pip = pipSize(pair);
@@ -566,7 +573,7 @@ export function enforceMinRewardRisk<
     ? mid - levels.invalidationPrice
     : levels.invalidationPrice - mid;
   if (risk <= 0 || toPips(pair, risk) > MAX_RISK_PIPS) return null;
-  const minReward = risk * MIN_REWARD_RISK;
+  const minReward = risk * MIN_REWARD_RISK + (MIN_REWARD_RISK + 1) * costPips * pip;
   const reward = long ? levels.targetPrice - mid : mid - levels.targetPrice;
   if (reward >= minReward - 1e-9) return levels;
   const raw = long ? mid + minReward : mid - minReward;

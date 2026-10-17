@@ -9,6 +9,7 @@ import {
   type Mt5Position,
 } from '../lib/mt5.js';
 import { roundToPip } from '../lib/market.js';
+import { recordQuotes, spreadPips } from '../lib/execution.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
 import type { PairCode } from '../lib/model.js';
 
@@ -37,6 +38,10 @@ mt5Router.get(
             lastBroker: link.lastBroker,
             lastPositions: link.lastPositions,
             lastMatched: link.lastMatched,
+            balance: link.lastBalance === null ? null : Number(link.lastBalance),
+            equity: link.lastEquity === null ? null : Number(link.lastEquity),
+            currency: link.lastCurrency,
+            peakEquity: link.peakEquity === null ? null : Number(link.peakEquity),
           }
         : null,
     });
@@ -61,6 +66,10 @@ mt5Router.post(
         lastBroker: null,
         lastPositions: null,
         lastMatched: null,
+        lastBalance: null,
+        lastEquity: null,
+        lastCurrency: null,
+        peakEquity: null,
       },
     });
     res.status(201).json({ key });
@@ -95,6 +104,15 @@ const positionSchema = z.object({
   closePrice: price.optional(),
   closeTime: z.coerce.number().int().positive().optional(),
   profit: z.coerce.number().finite().optional(),
+  commission: z.coerce.number().finite().optional(),
+  swap: z.coerce.number().finite().optional(),
+});
+const quoteSchema = z.object({
+  symbol: z.string().max(40),
+  bid: price,
+  ask: price,
+  /** Unix seconds, UTC. */
+  time: z.coerce.number().int().positive(),
 });
 const syncSchema = z.object({
   account: z.coerce.string().max(40).optional(),
@@ -102,6 +120,11 @@ const syncSchema = z.object({
   server: z.string().max(120).optional(),
   version: z.string().max(20).optional(),
   positions: z.array(positionSchema).max(500),
+  // EA 1.1+: live quotes and the account snapshot.
+  quotes: z.array(quoteSchema).max(20).optional(),
+  balance: z.coerce.number().finite().optional(),
+  equity: z.coerce.number().finite().optional(),
+  currency: z.string().max(8).optional(),
 });
 
 mt5SyncRouter.post(
@@ -126,6 +149,31 @@ mt5SyncRouter.post(
     const positions = parsed.data.positions.filter((p) =>
       pairFromSymbol(p.symbol)
     ) as Mt5Position[];
+
+    // Live bid/ask for the spread check and slippage. A quote older than a
+    // few minutes (market closed, terminal asleep) is not stored as live.
+    const now = Date.now();
+    const quotes = (parsed.data.quotes ?? [])
+      .map((q) => ({
+        pairCode: pairFromSymbol(q.symbol),
+        bid: q.bid,
+        ask: q.ask,
+        at: Math.min(q.time * 1000, now),
+      }))
+      .filter(
+        (q): q is { pairCode: PairCode; bid: number; ask: number; at: number } =>
+          q.pairCode !== null && now - q.at < 5 * 60_000
+      );
+    if (quotes.length > 0)
+      await recordQuotes(quotes, {
+        userId: link.userId,
+        broker: parsed.data.broker ?? null,
+      }).catch((error) =>
+        console.warn('Storing MT5 quotes failed.', error instanceof Error ? error.message : error)
+      );
+    const spreadNow = new Map(
+      quotes.map((q) => [q.pairCode, spreadPips(q.pairCode, q.bid, q.ask)])
+    );
 
     // Signals that could have been followed by these positions.
     const earliest = positions.length
@@ -175,7 +223,10 @@ mt5SyncRouter.post(
         exitReason: fill.exitPrice === null ? null : 'mt5',
         source: 'mt5',
         externalRef: fill.externalRef,
+        commission: fill.commission,
+        swap: fill.swap,
       };
+      const spread = spreadNow.get(pair);
       await prisma.userTrade.upsert({
         where: { userId_predictionId: { userId: link.userId, predictionId } },
         // Logged when it was opened, so "trades today" counts it correctly.
@@ -184,6 +235,8 @@ mt5SyncRouter.post(
           predictionId,
           createdAt: fill.openedAt,
           ...fields,
+          // The spread when the trade first showed up: close to its entry.
+          spreadPips: spread ?? null,
         },
         update: fields,
       });
@@ -198,6 +251,17 @@ mt5SyncRouter.post(
         lastBroker: parsed.data.broker ?? null,
         lastPositions: positions.length,
         lastMatched: positions.length - unmatched,
+        ...(parsed.data.equity !== undefined
+          ? {
+              lastBalance: parsed.data.balance ?? null,
+              lastEquity: parsed.data.equity,
+              lastCurrency: parsed.data.currency ?? null,
+              peakEquity: Math.max(
+                parsed.data.equity,
+                link.peakEquity === null ? parsed.data.equity : Number(link.peakEquity)
+              ),
+            }
+          : {}),
       },
     });
     res.json({

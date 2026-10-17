@@ -8,6 +8,14 @@ import {
   sendTestAlert,
   vapidPublicKey,
 } from '../lib/alerts.js';
+import {
+  newWebhookSecret,
+  readAlertTargets,
+  telegramConfigured,
+  telegramLink,
+  urlProblem,
+  type AlertTargets,
+} from '../lib/externalAlerts.js';
 import { asyncRoute } from '../middleware/asyncRoute.js';
 import { rateLimit } from '../middleware/rateLimit.js';
 
@@ -154,12 +162,22 @@ router.get(
   asyncRoute(async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: Number(req.user?.sub) },
-      select: { alertPrefs: true, email: true },
+      select: { alertPrefs: true, email: true, alertTargets: true },
     });
     if (!user)
       return res.status(401).json({ error: 'Account no longer exists.' });
+    const targets = readAlertTargets(user.alertTargets);
     res.json({
       prefs: readAlertPrefs(user.alertPrefs),
+      telegramAvailable: telegramConfigured(),
+      destinations: {
+        telegramLinked: Boolean(targets.telegramChatId),
+        discordWebhookUrl: targets.discordWebhookUrl
+          ? maskUrl(targets.discordWebhookUrl)
+          : null,
+        webhookUrl: targets.webhookUrl ?? null,
+        webhookSecret: targets.webhookSecret ?? null,
+      },
       email: user.email,
       emailAvailable: emailConfigured(),
       pushAvailable: pushConfigured(),
@@ -172,7 +190,13 @@ router.get(
 );
 
 const prefsSchema = z.object({
-  channels: z.object({ email: z.boolean(), push: z.boolean() }),
+  channels: z.object({
+    email: z.boolean(),
+    push: z.boolean(),
+    telegram: z.boolean().default(true),
+    discord: z.boolean().default(true),
+    webhook: z.boolean().default(true),
+  }),
   events: z.object({
     newSignal: z.boolean(),
     entry: z.boolean(),
@@ -230,6 +254,87 @@ router.post(
     res.status(204).end();
   })
 );
+
+/** Discord webhook URLs are secrets: show the start and the last 4 characters. */
+function maskUrl(url: string) {
+  return `${url.slice(0, url.indexOf('/api/webhooks/') + 14)}…${url.slice(-4)}`;
+}
+
+/** A one-time Telegram deep link that links this user's chat. */
+router.post(
+  '/telegram/link',
+  rateLimit(5, 10 * 60_000),
+  asyncRoute(async (req, res) => {
+    if (!telegramConfigured())
+      return res.status(503).json({ error: 'Telegram alerts are not set up on this server.' });
+    res.json({ url: await telegramLink(Number(req.user?.sub)) });
+  })
+);
+
+router.delete(
+  '/telegram',
+  asyncRoute(async (req, res) => {
+    await updateTargets(Number(req.user?.sub), { telegramChatId: null });
+    res.status(204).end();
+  })
+);
+
+const destinationsSchema = z.object({
+  /** null clears; omitted keeps. */
+  discordWebhookUrl: z.string().trim().max(500).nullable().optional(),
+  webhookUrl: z.string().trim().max(500).nullable().optional(),
+  /** true issues a new signing secret. */
+  rotateSecret: z.boolean().optional(),
+});
+
+router.put(
+  '/destinations',
+  asyncRoute(async (req, res) => {
+    const parsed = destinationsSchema.safeParse(req.body);
+    if (!parsed.success)
+      return res.status(400).json({ error: 'Invalid destinations.' });
+    const { discordWebhookUrl, webhookUrl, rotateSecret } = parsed.data;
+    for (const [value, kind] of [
+      [discordWebhookUrl, 'discord'],
+      [webhookUrl, 'webhook'],
+    ] as const) {
+      const problem = value ? urlProblem(value, kind) : null;
+      if (problem) return res.status(400).json({ error: problem });
+    }
+    const userId = Number(req.user?.sub);
+    const current = readAlertTargets(
+      (await prisma.user.findUnique({ where: { id: userId }, select: { alertTargets: true } }))
+        ?.alertTargets
+    );
+    const patch: AlertTargets = {};
+    if (discordWebhookUrl !== undefined) patch.discordWebhookUrl = discordWebhookUrl || null;
+    if (webhookUrl !== undefined) {
+      patch.webhookUrl = webhookUrl || null;
+      if (webhookUrl && !current.webhookSecret) patch.webhookSecret = newWebhookSecret();
+    }
+    if (rotateSecret) patch.webhookSecret = newWebhookSecret();
+    const next = await updateTargets(userId, patch);
+    res.json({
+      telegramLinked: Boolean(next.telegramChatId),
+      discordWebhookUrl: next.discordWebhookUrl ? maskUrl(next.discordWebhookUrl) : null,
+      webhookUrl: next.webhookUrl ?? null,
+      webhookSecret: next.webhookSecret ?? null,
+    });
+  })
+);
+
+async function updateTargets(userId: number, patch: AlertTargets) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { alertTargets: true },
+  });
+  const next = { ...readAlertTargets(user?.alertTargets), ...patch };
+  await prisma.user.update({
+    where: { id: userId },
+    data: { alertTargets: next as object },
+  });
+  return next;
+}
 
 /** One test alert on every enabled channel (3 per 10 minutes). */
 router.post(
