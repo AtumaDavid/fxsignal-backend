@@ -35,6 +35,11 @@ export interface PredictionOutcome {
 export type ReasonCode =
   // Stand-asides: why no trade was published.
   | 'CONTEXT_NEUTRAL'
+  | 'CONTEXT_SPLIT'
+  | 'CHOPPY'
+  | 'EXTREME_VOLATILITY'
+  | 'DUPLICATE_SETUP'
+  | 'H1_NOT_ALIGNED'
   | 'H1_AGAINST'
   | 'STRICT_WINDOW'
   | 'H1_NOT_REALIGNED'
@@ -58,6 +63,11 @@ export type ReasonCode =
 
 export const REASON_LABEL: Record<ReasonCode, string> = {
   CONTEXT_NEUTRAL: 'Daily/H4 context neutral',
+  CONTEXT_SPLIT: 'Daily and H4 disagree',
+  CHOPPY: 'Choppy market',
+  EXTREME_VOLATILITY: 'Extreme volatility',
+  DUPLICATE_SETUP: 'Same setup already published',
+  H1_NOT_ALIGNED: 'H1 not aligned yet',
   H1_AGAINST: 'H1 against the context',
   STRICT_WINDOW: 'Asia: not fully aligned',
   H1_NOT_REALIGNED: 'H1 not realigned after a stop',

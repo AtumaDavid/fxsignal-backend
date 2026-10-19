@@ -15,7 +15,8 @@
     "db:resettle": "tsx prisma/resettle.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "backtest:compare": "tsx scripts/backtest-compare.ts"
+    "backtest:compare": "tsx scripts/backtest-compare.ts",
+    "backtest:exits": "tsx scripts/exit-research.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",

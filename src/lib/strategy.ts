@@ -17,7 +17,7 @@ import { ROOM_BUFFER_PIPS } from './zones.js';
 // hash of every setting) changes on its own whenever any value does, so an
 // unversioned change still shows up.
 
-export const STRATEGY_VERSION = '2026.10.3';
+export const STRATEGY_VERSION = '2026.10.4';
 
 /** Entry-trigger rule versions: what "M15_CLOSE" meant at each step. */
 const TRIGGER_VERSION: Record<EntryTrigger, string> = {
@@ -35,6 +35,11 @@ export interface StrategySnapshot {
   entryTrigger: EntryTrigger;
   triggerVersion: string;
   confirmWindowBars: number;
+  /** Direction / regime filters in force. */
+  filters: Record<string, unknown> | null;
+  /** When pairs are re-read inside a window. */
+  scans: string | null;
+  setupCooldownHours: number | null;
   costs: Record<string, number>;
   risk: {
     minRewardRisk: number;
@@ -50,6 +55,9 @@ export function strategySnapshot(engine: {
   levelModel: 'atr' | 'zones';
   entryTrigger: EntryTrigger;
   confirmWindowBars: number;
+  filters?: Record<string, unknown>;
+  scans?: string;
+  setupCooldownHours?: number;
 }): StrategySnapshot {
   const body = {
     version: STRATEGY_VERSION,
@@ -58,6 +66,9 @@ export function strategySnapshot(engine: {
     entryTrigger: engine.entryTrigger,
     triggerVersion: TRIGGER_VERSION[engine.entryTrigger],
     confirmWindowBars: engine.confirmWindowBars,
+    filters: engine.filters ?? null,
+    scans: engine.scans ?? null,
+    setupCooldownHours: engine.setupCooldownHours ?? null,
     costs: { ...EXECUTION_COST_PIPS },
     risk: {
       minRewardRisk: MIN_REWARD_RISK,

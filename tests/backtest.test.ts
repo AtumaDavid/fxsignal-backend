@@ -99,3 +99,34 @@ describe('backtest', () => {
     expect(summary.wins + summary.losses + summary.earlyExits + summary.timeExits).toBe(summary.trades);
   });
 });
+
+describe('scans and the duplicate-setup guard', () => {
+  const history = synthetic('2025-10-01T00:00:00Z', '2026-07-01T00:00:00Z');
+  const from = new Date('2026-05-01T00:00:00Z');
+  const to = new Date('2026-07-01T00:00:00Z');
+  const start = simulatePair('EUR/USD', history, [], from, to, {}, { scans: 'none' });
+  const hourly = simulatePair('EUR/USD', history, [], from, to, {}, { scans: 'hourly' });
+
+  it('hourly scans add reads after the window start, never more than two trades per pair per window', () => {
+    expect(start.trades.every((t) => t.scan === 'start')).toBe(true);
+    expect(hourly.trades.some((t) => t.scan === 'rescan')).toBe(true);
+    const perWindow = new Map<string, number>();
+    for (const t of hourly.trades) {
+      expect(new Date(t.publishedAt).getUTCMinutes()).toBe(0);
+      const key = `${t.publishedAt.slice(0, 10)}-${t.session}`;
+      perWindow.set(key, (perWindow.get(key) ?? 0) + 1);
+    }
+    expect(Math.max(...perWindow.values())).toBeLessThanOrEqual(2);
+  });
+
+  it('never publishes the same setup twice within the cooldown', () => {
+    const seen = new Map<string, number>();
+    for (const t of hourly.trades) {
+      if (!t.setupKey) continue;
+      const at = Date.parse(t.publishedAt);
+      const prev = seen.get(t.setupKey);
+      if (prev !== undefined) expect(at - prev).toBeGreaterThanOrEqual(6 * 3_600_000);
+      seen.set(t.setupKey, at);
+    }
+  });
+});

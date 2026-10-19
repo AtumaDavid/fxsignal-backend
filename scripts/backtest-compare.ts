@@ -43,19 +43,48 @@ const devFrom = new Date(from);
 devFrom.setUTCMonth(devFrom.getUTCMonth() + holdoutMonths);
 
 type Engine = Parameters<typeof simulatePortfolio>[4];
-const VARIANTS: { name: string; engine: Engine; rules?: PortfolioRules; news?: boolean }[] = [
-  { name: 'ATR zone, fill on touch (old)', engine: { levelModel: 'atr', entryTrigger: 'TOUCH' } },
-  { name: 'ATR zone, M15-close trigger (live)', engine: { levelModel: 'atr', entryTrigger: 'M15_CLOSE' } },
-  { name: 'Zones: S/R levels + pivots', engine: { levelModel: 'zones', zoneSources: { demandSupply: false, orderBlocks: false } } },
-  { name: 'Zones: + demand/supply', engine: { levelModel: 'zones', zoneSources: { orderBlocks: false } } },
-  { name: 'Zones: + H1 order blocks', engine: { levelModel: 'zones' } },
-  {
-    name: 'Live, without news/portfolio rules',
-    engine: { levelModel: 'atr', entryTrigger: 'M15_CLOSE' },
-    rules: { usdCap: false, dailyLossLimit: false },
-    news: false,
-  },
-];
+type Variant = { name: string; engine: Engine; rules?: PortfolioRules; news?: boolean };
+/** The live engine with its default filters (DEFAULT_FILTERS). */
+const LIVE: Engine = { levelModel: 'atr', entryTrigger: 'M15_CLOSE' };
+/** All direction/regime filters off: the baseline each filter was tested against. */
+const NO_FILTERS = { contextAgreement: false, h1Aligned: false, minContextScore: 15, choppy: false, maxAtrRatio: null };
+const UNFILTERED: Engine = { ...LIVE, filters: NO_FILTERS };
+const LIVE_RULES: PortfolioRules = { scans: 'rearm' };
+
+/** SUITE=models (default): level models. SUITE=direction: direction, regime and scan rules, one at a time. */
+const SUITES: Record<string, Variant[]> = {
+  models: [
+    { name: 'ATR zone, fill on touch (old)', engine: { levelModel: 'atr', entryTrigger: 'TOUCH' } },
+    { name: 'ATR zone, M15-close trigger (live)', engine: LIVE, rules: LIVE_RULES },
+    { name: 'Zones: S/R levels + pivots', engine: { levelModel: 'zones', zoneSources: { demandSupply: false, orderBlocks: false } }, rules: LIVE_RULES },
+    { name: 'Zones: + demand/supply', engine: { levelModel: 'zones', zoneSources: { orderBlocks: false } }, rules: LIVE_RULES },
+    { name: 'Zones: + H1 order blocks', engine: { levelModel: 'zones' }, rules: LIVE_RULES },
+    {
+      name: 'Live, without news/portfolio rules',
+      engine: LIVE,
+      rules: { ...LIVE_RULES, usdCap: false, dailyLossLimit: false },
+      news: false,
+    },
+  ],
+  direction: [
+    { name: 'No filters (baseline)', engine: UNFILTERED, rules: LIVE_RULES },
+    { name: '+ Daily and H4 must agree', engine: { ...LIVE, filters: { ...NO_FILTERS, contextAgreement: true } }, rules: LIVE_RULES },
+    { name: '+ H1 must agree (not just not oppose)', engine: { ...LIVE, filters: { ...NO_FILTERS, h1Aligned: true } }, rules: LIVE_RULES },
+    { name: '+ context score ≥ 30', engine: { ...LIVE, filters: { ...NO_FILTERS, minContextScore: 30 } }, rules: LIVE_RULES },
+    { name: '+ stand aside when H1 is choppy', engine: { ...LIVE, filters: { ...NO_FILTERS, choppy: true } }, rules: LIVE_RULES },
+    { name: '+ stand aside at ≥ 2× usual volatility', engine: { ...LIVE, filters: { ...NO_FILTERS, maxAtrRatio: 2 } }, rules: LIVE_RULES },
+    { name: 'Live filters (agreement + volatility guard)', engine: LIVE, rules: LIVE_RULES },
+    { name: 'Live filters, scans at window start only', engine: LIVE, rules: { ...LIVE_RULES, scans: 'none' } },
+    { name: 'Live filters, scans every H1 close (spec)', engine: LIVE, rules: { ...LIVE_RULES, scans: 'hourly' } },
+    { name: 'Live filters, no duplicate-setup cooldown', engine: LIVE, rules: { ...LIVE_RULES, setupCooldownMs: 0 } },
+  ],
+  selected: [
+    { name: 'No filters (baseline)', engine: UNFILTERED, rules: LIVE_RULES },
+    { name: 'Live filters (agreement + volatility guard)', engine: LIVE, rules: LIVE_RULES },
+  ],
+};
+const suite = process.env.SUITE ?? 'models';
+const VARIANTS = SUITES[suite] ?? SUITES.models;
 
 async function storedEvents(): Promise<LiveMarketEvent[]> {
   try {

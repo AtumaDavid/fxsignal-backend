@@ -77,6 +77,8 @@ import { peekStale } from './rateCache.js';
 import { signalFeatures, type SignalFeatures } from './regime.js';
 import { liveSpread, MAX_SPREAD_PIPS, pruneSpreadSamples } from './execution.js';
 import { strategySnapshot, type StrategySnapshot } from './strategy.js';
+import { creditUsage } from './rateCache.js';
+import { paperModel, recordPaperSignal, settlePaperSignals } from './paper.js';
 import {
   blackoutsFromJson,
   newsBlackouts,
@@ -290,7 +292,7 @@ async function activePrediction(pairCode: PairCode, now: Date) {
 // Always runs on real indicators. The AI refines this when available; when the
 // AI is disabled or fails, these signals still publish with RULE_BASED.
 
-interface DeterministicSignal {
+export interface DeterministicSignal {
   pairCode: PairCode;
   direction: Direction;
   confidence: number;
@@ -346,6 +348,58 @@ const H1_STRUCTURE_BARS = 10;
 /** Zone model: how far from price a zone may sit and still be traded this window. */
 const ZONE_REACH_ATR = 1.5;
 const ZONE_REACH_MIN_PIPS = 15;
+/**
+ * Direction and regime filters (spec: direction first). Each was tested on
+ * its own in the backtest before being switched on; see
+ * docs/technical-guide.md 5.6 for the results and which are live.
+ */
+export interface DirectionFilters {
+  /** Daily and H4 must both point the trade's way (not just the weighted score). */
+  contextAgreement?: boolean;
+  /** H1 must agree with the context (not just "not oppose" it). */
+  h1Aligned?: boolean;
+  /** Minimum |weighted Daily+H4 score| to trade (the engine's own threshold is 15). */
+  minContextScore?: number;
+  /** Stand aside when H1 is choppy (efficiency ratio below 0.2 over 20 bars). */
+  choppy?: boolean;
+  /** Stand aside when H1 ATR is at least this multiple of its usual level (null = off). */
+  maxAtrRatio?: number | null;
+}
+
+/**
+ * Live defaults, each chosen by the development-period backtest (guide 5.6):
+ * Daily+H4 agreement cut the loss from −22.5R to −6.6R over 290 trades and
+ * improved 4 of 6 quarters; the 2× volatility guard is a small risk control
+ * that did not hurt. H1 agreement, a stronger context score and the choppy
+ * filter did not help and stay off.
+ */
+export const DEFAULT_FILTERS: Required<DirectionFilters> = {
+  contextAgreement: true,
+  h1Aligned: false,
+  minContextScore: 15,
+  choppy: false,
+  maxAtrRatio: 2,
+};
+
+/** Score each of Daily and H4 needs, in the trade's direction, to "agree". */
+const CONTEXT_AGREE_SCORE = 15;
+
+/** Setups within this many pips of structure are the same setup. */
+const SETUP_BUCKET_PIPS = 5;
+
+export function setupKey(
+  pair: PairCode,
+  direction: Direction,
+  levelModel: 'atr' | 'zones',
+  structure: number | null
+): string {
+  const bucket =
+    structure === null
+      ? 'x'
+      : String(Math.round(structure / (SETUP_BUCKET_PIPS * pipSize(pair))));
+  return `${pair}:${direction}:${levelModel}:${bucket}`;
+}
+
 /** Zone model: the stop is at least this many H1 ATRs from the entry midpoint. */
 const ZONE_STOP_ATR = 0.6;
 
@@ -395,6 +449,8 @@ export function buildDeterministicSignal(
     requireRoom?: boolean;
     /** Which zone sources to build (all by default). */
     zoneSources?: ZoneSourceSet;
+    /** Direction and regime filters; see DirectionFilters. */
+    filters?: DirectionFilters;
   } = {}
 ): DeterministicSignal | null {
   const levelModel = options.levelModel ?? 'atr';
@@ -421,6 +477,57 @@ export function buildDeterministicSignal(
       : Math.abs(conf.score) >= 15
         ? 'H1_AGAINST'
         : 'CONTEXT_NEUTRAL';
+  // Market conditions (labels, and the regime filters below).
+  const byTf = (tf: Timeframe) => views.find((v) => v.timeframe === tf);
+  const features = signalFeatures({
+    contextScore: conf.score,
+    daily: byTf('DAILY'),
+    h4: byTf('H4'),
+    h1Candles: mtf.H1 ?? [],
+    newsInWindow:
+      newsBlackouts(events, pair, now.getTime(), (options.windowEnd ?? now).getTime()).length > 0,
+  });
+  const filters = { ...DEFAULT_FILTERS, ...(options.filters ?? {}) };
+  if (conf.direction !== 'NEUTRAL') {
+    const sign = conf.direction === 'LONG' ? 1 : -1;
+    const agrees = (v?: TimeframeView) =>
+      Boolean(v) && sign * v!.biasScore >= CONTEXT_AGREE_SCORE;
+    if (Math.abs(conf.score) < filters.minContextScore) {
+      reasonCode = 'CONTEXT_NEUTRAL';
+      conf.notes.unshift(
+        `Daily/H4 context (${conf.score}) is not strong enough (needs ${filters.minContextScore}).`
+      );
+      conf.direction = 'NEUTRAL';
+    } else if (filters.contextAgreement && !(agrees(byTf('DAILY')) && agrees(byTf('H4')))) {
+      reasonCode = 'CONTEXT_SPLIT';
+      conf.notes.unshift(
+        'Daily and H4 do not both point the same way — no trade until they agree.'
+      );
+      conf.direction = 'NEUTRAL';
+    } else if (filters.h1Aligned && !conf.h1Aligned) {
+      reasonCode = 'H1_NOT_ALIGNED';
+      conf.notes.unshift(
+        'H1 does not yet agree with the daily/H4 direction — wait for it.'
+      );
+      conf.direction = 'NEUTRAL';
+    } else if (filters.choppy && features.choppy) {
+      reasonCode = 'CHOPPY';
+      conf.notes.unshift(
+        `H1 is choppy (efficiency ${features.efficiency}) — price is going nowhere; stand aside.`
+      );
+      conf.direction = 'NEUTRAL';
+    } else if (
+      filters.maxAtrRatio !== null &&
+      features.atrRatio !== null &&
+      features.atrRatio >= filters.maxAtrRatio
+    ) {
+      reasonCode = 'EXTREME_VOLATILITY';
+      conf.notes.unshift(
+        `H1 volatility is ${features.atrRatio}× its usual level — stand aside until it settles.`
+      );
+      conf.direction = 'NEUTRAL';
+    }
+  }
   if (conf.direction !== 'NEUTRAL') {
     if (
       options.strict &&
@@ -630,14 +737,25 @@ export function buildDeterministicSignal(
     zone,
     blackouts,
     reasonCode: direction === 'NEUTRAL' ? (reasonCode ?? 'CONTEXT_NEUTRAL') : null,
-    features: signalFeatures({
-      contextScore: conf.score,
-      daily: views.find((v) => v.timeframe === 'DAILY'),
-      h4: views.find((v) => v.timeframe === 'H4'),
-      h1Candles: mtf.H1 ?? [],
-      newsInWindow:
-        newsBlackouts(events, pair, now.getTime(), (options.windowEnd ?? now).getTime()).length > 0,
-    }),
+    features: {
+      ...features,
+      // Same direction + same structure (bucketed) = the same setup.
+      setupKey:
+        direction === 'NEUTRAL'
+          ? null
+          : setupKey(
+              pair,
+              direction,
+              levelModel,
+              zone
+                ? direction === 'LONG'
+                  ? zone.low
+                  : zone.high
+                : direction === 'LONG'
+                  ? swingLow
+                  : swingHigh
+            ),
+    },
     levelInputs: { atr: h1.atr, swingHigh, swingLow },
   };
 }
@@ -766,6 +884,9 @@ function toPrediction(
     levelModel: signal.levelModel,
     entryTrigger: signal.entryTrigger,
     confirmWindowBars: CONFIRM_WINDOW_BARS,
+    filters: liveFilters(),
+    scans: liveScanMode(),
+    setupCooldownHours: SETUP_COOLDOWN_MS / 3_600_000,
   });
   return {
     id: '',
@@ -896,6 +1017,49 @@ interface GenerationTarget {
   pair: PairCode;
   /** Set when this is an early re-check after the pair's trade closed. */
   rearmAfter?: 'target' | 'stopped';
+  /** Hourly re-read after a stand-aside (SIGNAL_SCANS=hourly). */
+  scan?: boolean;
+}
+
+/**
+ * When pairs are re-read inside London and New York (see PortfolioRules in
+ * backtest.ts): rearm = after the pair's trade finished (default); hourly =
+ * also at every H1 close after a stand-aside (SIGNAL_SCANS=hourly).
+ */
+export function liveScanMode(): 'rearm' | 'hourly' {
+  return process.env.SIGNAL_SCANS === 'hourly' ? 'hourly' : 'rearm';
+}
+
+/** The direction/regime filters live signals use (DEFAULT_FILTERS). */
+export function liveFilters(): Required<DirectionFilters> {
+  return { ...DEFAULT_FILTERS };
+}
+
+/** The live rule snapshot (versioning), for signals and backtest runs. */
+export function liveStrategy(): StrategySnapshot {
+  return strategySnapshot({
+    ...liveLevelModel(),
+    confirmWindowBars: CONFIRM_WINDOW_BARS,
+    filters: liveFilters(),
+    scans: liveScanMode(),
+    setupCooldownHours: SETUP_COOLDOWN_MS / 3_600_000,
+  });
+}
+
+/** Share of the daily provider allowance after which scans stop / new reads stop. */
+const SCAN_BUDGET_SHARE = 0.85;
+const HARD_BUDGET_SHARE = 0.95;
+
+/** How much of today's provider allowance is left for new reads. */
+async function creditBudget(): Promise<'ok' | 'no-scans' | 'exhausted'> {
+  const usage = await creditUsage().catch(() => null);
+  if (!usage) return 'ok';
+  const share = usage.usedToday / usage.dailyLimit;
+  return share >= HARD_BUDGET_SHARE
+    ? 'exhausted'
+    : share >= SCAN_BUDGET_SHARE
+      ? 'no-scans'
+      : 'ok';
 }
 
 /**
@@ -910,6 +1074,77 @@ export function liveLevelModel(): {
   return process.env.SIGNAL_LEVEL_MODEL === 'zones'
     ? { levelModel: 'zones', entryTrigger: 'M15_CLOSE' }
     : { levelModel: 'atr', entryTrigger: 'M15_CLOSE' };
+}
+
+/**
+ * The candles one read needs, cheaply: H1 must include the last closed H1
+ * candle (one credit when it does not); Daily and H4 come from the cache and
+ * refresh only past their TTL; M15 is whatever is cached (no credit).
+ */
+async function readForScan(pair: PairCode, now: Date): Promise<MultiTimeframe> {
+  const lastH1 = Math.floor(now.getTime() / 3_600_000) * 3_600_000 - 3_600_000;
+  const [daily, h4, h1, m15] = await Promise.all([
+    fetchTimeframeCandles(pair, 'DAILY').catch(() => [] as Candle[]),
+    fetchTimeframeCandles(pair, 'H4').catch(() => [] as Candle[]),
+    fetchTimeframeCandles(pair, 'H1', lastH1),
+    // Nothing cached yet (first run): fetch it once.
+    peekStale<Candle[]>(`twelvedata:tf:${pair}:M15`)
+      .then((c) => (c?.length ? c : fetchTimeframeCandles(pair, 'M15')))
+      .catch(() => [] as Candle[]),
+  ]);
+  return {
+    MONTHLY: [],
+    WEEKLY: [],
+    DAILY: daily,
+    H4: h4,
+    H1: h1,
+    M15: m15,
+  };
+}
+
+/** Builds and records the paper model's call for this window (trades only). */
+async function paperTrade(
+  pair: PairCode,
+  mtf: MultiTimeframe,
+  m15Fresh: boolean,
+  model: 'atr' | 'zones',
+  events: LiveMarketEvent[],
+  window: TradingWindow,
+  hint: string,
+  now: Date
+) {
+  const build = (candles: MultiTimeframe) =>
+    buildDeterministicSignal(pair, candles, events, window.label, hint, now, {
+      windowEnd: window.end,
+      strict: window.strict,
+      filters: liveFilters(),
+      levelModel: model,
+      entryTrigger: 'M15_CLOSE',
+    });
+  let signal = build(mtf);
+  if (!signal || signal.direction === 'NEUTRAL') return;
+  if (!m15Fresh) {
+    const lastM15 = Math.floor(now.getTime() / M15_MS) * M15_MS - M15_MS;
+    mtf.M15 = await fetchTimeframeCandles(pair, 'M15', lastM15).catch(() => mtf.M15);
+    signal = build(mtf);
+    if (!signal || signal.direction === 'NEUTRAL') return;
+  }
+  await recordPaperSignal({
+    model,
+    pair,
+    windowKey: window.key,
+    session: window.label,
+    validFrom: now,
+    expiresAt: window.end,
+    signal,
+    strategy: strategySnapshot({
+      levelModel: model,
+      entryTrigger: 'M15_CLOSE',
+      confirmWindowBars: CONFIRM_WINDOW_BARS,
+      filters: liveFilters(),
+      scans: 'none',
+    }),
+  });
 }
 
 async function liveIntradayPredictions(
@@ -932,25 +1167,55 @@ async function liveIntradayPredictions(
     signal: DeterministicSignal;
     mtfContext: MtfPairContext;
   }[] = [];
-  for (const { pair, rearmAfter } of targets) {
+  for (const { pair, rearmAfter, scan } of targets) {
     try {
-      // Only the four intraday timeframes: monthly/weekly are not needed here
-      // (and skipping them saves provider credits).
-      const mtf = await fetchMultiTimeframe(pair, INTRADAY_TIMEFRAMES);
-      const signal = buildDeterministicSignal(
-        pair,
-        mtf,
-        events,
-        window.label,
-        info.playbookHint,
-        now,
-        {
-          windowEnd: window.end,
-          strict: window.strict,
-          requireH1Aligned: rearmAfter === 'stopped',
-          ...liveLevelModel(),
-        }
-      );
+      // Free-plan friendly read: H1 refreshed to its last close, Daily and H4
+      // from the cache (refetched only past their TTL), M15 from the cache as
+      // it is. Only a trade candidate pays for fresh M15 (below).
+      const mtf = await readForScan(pair, now);
+      const build = (candles: MultiTimeframe) =>
+        buildDeterministicSignal(
+          pair,
+          candles,
+          events,
+          window.label,
+          info.playbookHint,
+          now,
+          {
+            windowEnd: window.end,
+            strict: window.strict,
+            requireH1Aligned: rearmAfter === 'stopped',
+            filters: liveFilters(),
+            ...liveLevelModel(),
+          }
+        );
+      let signal = build(mtf);
+      let m15Fresh = false;
+      // Fresh M15 only for a trade candidate — or for an Asia call that the
+      // strict filter rejected on stale M15 (its confidence counts M15).
+      if (
+        signal &&
+        (signal.direction !== 'NEUTRAL' || signal.reasonCode === 'STRICT_WINDOW')
+      ) {
+        const lastM15 = Math.floor(now.getTime() / M15_MS) * M15_MS - M15_MS;
+        const m15 = await fetchTimeframeCandles(pair, 'M15', lastM15).catch(
+          () => mtf.M15
+        );
+        mtf.M15 = m15;
+        m15Fresh = true;
+        signal = build(mtf) ?? signal;
+      }
+      // Forward paper trading of the candidate model, at window starts only.
+      const paper = paperModel(liveLevelModel().levelModel);
+      if (paper && !rearmAfter && !scan) {
+        await paperTrade(pair, mtf, m15Fresh, paper, events, window, info.playbookHint, now).catch(
+          (error) =>
+            console.warn(
+              `Paper trade for ${pair} failed.`,
+              error instanceof Error ? error.message : error
+            )
+        );
+      }
       if (!signal) {
         console.warn(`Insufficient MTF context for ${pair}; skipping.`);
         continue;
@@ -977,11 +1242,13 @@ async function liveIntradayPredictions(
   if (contexts.length === 0)
     throw new Error('No multi-timeframe data available.');
 
+  // The model reviews trade candidates only: stand-asides never reach it.
+  const candidates = contexts.filter((c) => c.signal.direction !== 'NEUTRAL');
   let aiResults: IntradayAiResult[] = [];
-  if (aiAnalysisEnabled()) {
+  if (aiAnalysisEnabled() && candidates.length > 0) {
     try {
       aiResults = await requestIntradayAnalysis(
-        contexts.map((c) => c.mtfContext),
+        candidates.map((c) => c.mtfContext),
         events
       );
     } catch (error) {
@@ -2131,7 +2398,10 @@ async function windowHasRoom(pair: PairCode, window: TradingWindow) {
 /** Re-checks are attempted at most once per pair per H1 candle. */
 const lastRearmCheck = new Map<PairCode, string>();
 /** Leave at least this long in the window for a re-check trade to work. */
-const REARM_MIN_TIME_LEFT_MS = 45 * 60_000;
+export const REARM_MIN_LEFT_MS = 45 * 60_000;
+const REARM_MIN_TIME_LEFT_MS = REARM_MIN_LEFT_MS;
+/** A setup (pair + direction + structure) is not republished within this. */
+export const SETUP_COOLDOWN_MS = 6 * 3_600_000;
 
 /** The first H1 close after a trade closed inside the M15 candle at `closedAt`. */
 function nextH1Close(closedAt: string): Date {
@@ -2235,6 +2505,26 @@ async function applyPortfolioRules(
   const ordered = [...signals].sort((a, b) => b.confidence - a.confidence);
   const out = new Map<string, PublishedPrediction>();
   for (const signal of ordered) {
+    // The same setup (pair + direction + structure) is not published twice
+    // within SETUP_COOLDOWN_MS, whatever triggered the read.
+    const key = signal.meta?.features.setupKey;
+    if (signal.direction !== 'NEUTRAL' && key) {
+      const seen = await prisma.prediction
+        .findFirst({
+          where: {
+            features: { path: ['setupKey'], equals: key },
+            validFrom: { gte: new Date(now.getTime() - SETUP_COOLDOWN_MS) },
+          },
+          select: { id: true, validFrom: true },
+        })
+        .catch(() => null);
+      if (seen) {
+        const reason = `Same setup as the signal published at ${utcClock(seen.validFrom.toISOString())} — not republished within ${SETUP_COOLDOWN_MS / 3_600_000} hours.`;
+        console.info(`${signal.pairCode}: ${reason}`);
+        out.set(signal.pairCode, standAside(signal, reason, 'DUPLICATE_SETUP'));
+        continue;
+      }
+    }
     // Execution: an abnormally wide live spread (when a terminal reports one).
     const spread = await liveSpread(signal.pairCode, now).catch(() => null);
     if (signal.meta) signal.meta.features.spreadPips = spread?.spreadPips ?? null;
@@ -2265,6 +2555,13 @@ export async function getOrCreatePredictions(
   const window = tradingWindowAt(now);
   if (!window) return getCurrentPredictions(now);
 
+  // Free-plan guard: near the daily allowance, scans stop first, then
+  // everything new; stored signals keep being served.
+  const budget = await creditBudget();
+  if (budget === 'exhausted') {
+    console.warn('Provider credits nearly used up for today: no new reads.');
+    return getCurrentPredictions(now);
+  }
   const activeRows = await Promise.all(
     pairs.map((pair) => activePrediction(pair, now))
   );
@@ -2282,14 +2579,28 @@ export async function getOrCreatePredictions(
       targets.push({ pair });
       continue;
     }
+    if (budget !== 'ok' || !window.rearm || active.continuesId !== null)
+      continue;
+    // Hourly scan (SIGNAL_SCANS=hourly): after a stand-aside, the pair is
+    // read again at each H1 close. It publishes only a real setup; another
+    // stand-aside leaves the window's call as it is.
+    if (active.direction === 'NEUTRAL') {
+      if (liveScanMode() !== 'hourly') continue;
+      if (
+        now < nextH1Close(active.validFrom.toISOString()) ||
+        window.end.getTime() - now.getTime() < REARM_MIN_TIME_LEFT_MS
+      )
+        continue;
+      const hourKey = now.toISOString().slice(0, 13);
+      if (lastRearmCheck.get(pair) === hourKey) continue;
+      if (!(await windowHasRoom(pair, window))) continue;
+      lastRearmCheck.set(pair, hourKey);
+      targets.push({ pair, scan: true });
+      closedRows.set(pair, active);
+      continue;
+    }
     // Early re-check: only for a real trade that is already finished — by
     // target or stop, or by the H1 checkpoint (cancelled / closed early).
-    if (
-      !window.rearm ||
-      active.direction === 'NEUTRAL' ||
-      active.continuesId !== null
-    )
-      continue;
     const status = active.outcome?.status;
     let checkAt: Date;
     let after: GenerationTarget['rearmAfter'];
@@ -2333,10 +2644,10 @@ export async function getOrCreatePredictions(
 
   // First-generation attempts share the failure cooldown; re-checks are
   // already limited to one per H1 candle.
-  const firstGen = targets.filter((t) => !t.rearmAfter);
+  const firstGen = targets.filter((t) => !t.rearmAfter && !t.scan);
   if (firstGen.length > 0 && !options?.force) {
     if (now.getTime() - lastAiGenerationAttempt < AI_GENERATION_COOLDOWN_MS) {
-      const rearms = targets.filter((t) => t.rearmAfter);
+      const rearms = targets.filter((t) => t.rearmAfter || t.scan);
       targets.splice(0, targets.length, ...rearms);
     } else {
       lastAiGenerationAttempt = now.getTime();
@@ -2381,12 +2692,12 @@ export async function getOrCreatePredictions(
     const signal = signals.find((s) => s.pairCode === target.pair);
     if (!signal) continue;
     try {
-      if (target.rearmAfter) {
+      if (target.rearmAfter || target.scan) {
         // A re-check only publishes a new trade; a stand-aside keeps the
-        // closed trade on screen until the window ends.
+        // window's existing call on screen until the window ends.
         if (signal.direction === 'NEUTRAL') {
           console.info(
-            `Re-check for ${target.pair}: no new setup this candle.`
+            `${target.scan ? 'Hourly scan' : 'Re-check'} for ${target.pair}: no new setup this candle${signal.reasonCode ? ` (${signal.reasonCode})` : ''}.`
           );
           continue;
         }
@@ -3170,6 +3481,12 @@ async function runMaintenance(now: Date, options?: { force?: boolean }) {
     );
   }
   await pruneSpreadSamples(now).catch(() => undefined);
+  await settlePaperSignals(now).catch((error) =>
+    console.warn(
+      'Paper settlement failed.',
+      error instanceof Error ? error.message : error
+    )
+  );
 }
 
 /**

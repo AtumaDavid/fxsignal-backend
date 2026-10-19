@@ -16,9 +16,15 @@ import {
   buildDeterministicSignal,
   decideOnH1Close,
   CONFIRM_WINDOW_BARS,
+  MAX_SIGNALS_PER_WINDOW,
+  REARM_MIN_LEFT_MS,
+  SETUP_COOLDOWN_MS,
   finalTarget,
   lifecycleStage,
+  liveFilters,
   liveLevelModel,
+  liveScanMode,
+  liveStrategy,
   replayPath,
   settleFromPath,
   tradeHoldUntil,
@@ -35,6 +41,7 @@ import type { SignalFeatures } from './regime.js';
 import { strategySnapshot } from './strategy.js';
 import { fetchOandaHistory } from './oanda.js';
 import {
+  COMMISSION_PIPS,
   SLIPPAGE_PIPS,
   EXECUTION_COST_PIPS,
   monteCarlo,
@@ -229,6 +236,13 @@ export interface BacktestTrade {
   features: SignalFeatures | null;
   /** H1 ATR at publish, in pips. */
   atrPips: number | null;
+  /** The engine's fill (for exit research), when it filled. */
+  fillPrice?: number | null;
+  filledAt?: string | null;
+  /** Same pair + direction + structure = same setup (duplicate guard). */
+  setupKey?: string | null;
+  /** Published at the window start, or by a later H1 scan. */
+  scan?: 'start' | 'rescan';
 }
 
 /** Index of the newest candle that has closed by `t` (oldest-first input). */
@@ -323,10 +337,15 @@ function simulateTrade(
       path.filledAt === null ? undefined : m15.find((c) => candleTime(c) === path.filledAt);
     const fillSpreadPips =
       fillCandle?.spread === undefined ? null : fillCandle.spread / pipSize(pair);
+    const fill = {
+      fillPrice: path.fillPrice,
+      filledAt: path.filledAt === null ? null : new Date(path.filledAt).toISOString(),
+    };
     if (path.state === 'target' || path.state === 'stopped') {
       const s = settleFromPath(levels, path, after);
       return {
         fillSpreadPips,
+        ...fill,
         status: s.status,
         filled,
         closedAt: path.closedAt ? new Date(path.closedAt).toISOString() : null,
@@ -353,6 +372,7 @@ function simulateTrade(
     if (limit >= holdUntil) {
       return {
         fillSpreadPips,
+        ...fill,
         status: 'EXPIRED',
         filled,
         closedAt: new Date(holdUntil).toISOString(),
@@ -406,6 +426,7 @@ function simulateTrade(
         if (decision.action === 'exit')
           return {
             fillSpreadPips,
+        ...fill,
             status: 'CLOSED_EARLY',
             filled: true,
             closedAt: new Date(t).toISOString(),
@@ -430,7 +451,19 @@ export interface PortfolioRules {
   usdCap?: boolean;
   /** No new trades after DAILY_LOSS_LIMIT_R of closed losses in a UTC day. */
   dailyLossLimit?: boolean;
+  /**
+   * When pairs are re-read inside a window:
+   * - none: only at the window start (the original backtest);
+   * - rearm: also at H1 closes after the pair's trade finished (live today);
+   * - hourly: also at every H1 close while the pair has no active trade
+   *   (London/New York), the spec's hourly scan.
+   */
+  scans?: ScanMode;
+  /** A setup (pair + direction + structure) is not republished within this. */
+  setupCooldownMs?: number;
 }
+
+export type ScanMode = 'none' | 'rearm' | 'hourly';
 
 export interface SimulationResult {
   trades: BacktestTrade[];
@@ -444,9 +477,11 @@ export interface SimulationResult {
 
 /**
  * Every session window of every trading day in [from, to), for all pairs
- * together so the portfolio rules see both: at each window the pairs' calls
+ * together so the portfolio rules see both: at each read the pairs' calls
  * are built, the higher-confidence call goes first, and each must pass the
- * USD cap and daily loss limit against trades already published.
+ * duplicate-setup guard, the USD cap and the daily loss limit against trades
+ * already published. Reads happen at the window start and, depending on
+ * `scans`, at later H1 closes inside London and New York.
  * Pure (no I/O): history and events are passed in.
  */
 export function simulatePortfolio(
@@ -457,11 +492,18 @@ export function simulatePortfolio(
   /** Engine variant to replay (default: the live engine). */
   engine: Pick<
     NonNullable<Parameters<typeof buildDeterministicSignal>[6]>,
-    'levelModel' | 'entryTrigger' | 'requireRoom' | 'zoneSources'
+    'levelModel' | 'entryTrigger' | 'requireRoom' | 'zoneSources' | 'filters'
   > = {},
   rules: PortfolioRules = {}
 ): SimulationResult {
-  const use = { costs: true, usdCap: true, dailyLossLimit: true, ...rules };
+  const use = {
+    costs: true,
+    usdCap: true,
+    dailyLossLimit: true,
+    scans: 'none' as ScanMode,
+    setupCooldownMs: SETUP_COOLDOWN_MS,
+    ...rules,
+  };
   const pairs = PAIRS.filter((p) => histories[p]);
   const trades: BacktestTrade[] = [];
   let standAsides = 0;
@@ -505,140 +547,188 @@ export function simulatePortfolio(
       if (start < from.getTime() || start >= to.getTime()) continue;
       const window = tradingWindowAt(new Date(start));
       if (!window || window.start.getTime() !== start) continue;
+      const windowEnd = window.end.getTime();
 
-      const calls: {
-        pair: PairCode;
-        signal: NonNullable<ReturnType<typeof buildDeterministicSignal>>;
-      }[] = [];
-      for (const pair of pairs) {
-        if (start < (busyUntil.get(pair) ?? 0)) {
-          skippedOpen += 1;
-          continue;
-        }
-        const history = histories[pair]!;
-        const mtf = Object.fromEntries(
-          (['MONTHLY', 'WEEKLY', ...INTRADAY_TIMEFRAMES] as Timeframe[]).map(
-            (tf) => [tf, closedBy(history[tf] ?? [], tf, start, BARS[tf] ?? 0)]
-          )
-        ) as Record<Timeframe, Candle[]>;
-        if (mtf.M15.length < 20 || mtf.H1.length < 20) continue;
-        const windowEvents = events.filter(
-          (e) =>
-            e.eventDate.getTime() >= start - 30 * 60_000 &&
-            e.eventDate.getTime() <= window.end.getTime()
-        );
-        const signal = buildDeterministicSignal(
-          pair,
-          mtf,
-          windowEvents,
-          window.label,
-          sessionInfo(window.start).playbookHint,
-          window.start,
-          { windowEnd: window.end, strict: window.strict, ...engine }
-        );
-        if (!signal) continue;
-        if (signal.direction === 'NEUTRAL') {
-          standAsides += 1;
-          countReason(signal.reasonCode);
-          continue;
-        }
-        calls.push({ pair, signal });
-      }
+      // Read times: the window start, then H1 closes (London / New York).
+      const reads = [start];
+      if (use.scans !== 'none' && window.rearm)
+        for (let t = start + 3_600_000; windowEnd - t >= REARM_MIN_LEFT_MS; t += 3_600_000)
+          reads.push(t);
 
-      calls.sort((a, b) => b.signal.confidence - a.signal.confidence);
-      for (const { pair, signal } of calls) {
-        const dayStart = day.getTime();
-        const lostToday = use.dailyLossLimit
-          ? trades
-              .filter(
-                (t) =>
-                  t.filled &&
-                  t.r !== null &&
-                  t.closedAt &&
-                  Date.parse(t.closedAt) >= dayStart &&
-                  Date.parse(t.closedAt) <= start
-              )
-              .reduce((sum, t) => sum + t.r!, 0)
-          : 0;
-        const active = use.usdCap
-          ? trades
-              .filter((t) => Date.parse(t.publishedAt) <= start && endOf(t) > start)
-              .map((t) => ({ pairCode: t.pairCode, direction: t.direction }))
-          : [];
-        const block = portfolioBlock(
-          { pairCode: pair, direction: signal.direction },
-          active,
-          lostToday
-        );
-        if (block) {
-          portfolioBlocked += 1;
-          countReason(block.code);
-          continue;
-        }
-
-        const levels = {
-          pairCode: pair,
-          direction: signal.direction,
-          entryLow: signal.entryLow,
-          entryHigh: signal.entryHigh,
-          targetPrice: signal.targetPrice,
-          invalidationPrice: signal.invalidationPrice,
-          target3Price: finalTarget({ ...signal, pairCode: pair }),
-          entryTrigger: signal.entryTrigger,
-          blackouts: signal.blackouts,
-        };
-        const mid = (levels.entryLow + levels.entryHigh) / 2;
-        const result = simulateTrade(
-          pair,
-          levels,
-          start,
-          window.end.getTime(),
-          histories[pair]!,
-          viewFor(pair)
-        );
-        // Real spread at the fill + slippage on bid/ask history; else the
-        // fixed typical cost.
-        const { fillSpreadPips, ...outcome } = result;
-        const costPips =
-          use.costs && result.filled && result.pips !== null
-            ? fillSpreadPips != null
-              ? Number((fillSpreadPips + SLIPPAGE_PIPS).toFixed(2))
-              : EXECUTION_COST_PIPS[pair]
-            : 0;
-        const pips =
-          result.pips === null ? null : Number((result.pips - costPips).toFixed(1));
-        const r =
-          pips !== null && signal.stopPips > 0
-            ? Number((pips / signal.stopPips).toFixed(2))
-            : null;
-        trades.push({
-          pairCode: pair,
-          session: window.label,
-          direction: signal.direction as 'LONG' | 'SHORT',
-          confidence: signal.confidence,
-          publishedAt: window.start.toISOString(),
-          entryLow: levels.entryLow,
-          entryHigh: levels.entryHigh,
-          stop: levels.invalidationPrice,
-          tp1: mid + (mid - levels.invalidationPrice),
-          tp2: levels.targetPrice,
-          tp3: levels.target3Price ?? levels.targetPrice,
-          stopPips: signal.stopPips,
-          ...outcome,
-          pips,
-          costPips,
-          r,
-          features: signal.features,
-          atrPips: signal.atrPips,
-        });
-        // A filled trade blocks new windows on this pair until it closes.
-        if (result.filled)
-          busyUntil.set(
-            pair,
-            result.closedAt
-              ? new Date(result.closedAt).getTime()
-              : Number.MAX_SAFE_INTEGER
+      for (const at of reads) {
+        const first = at === start;
+        const calls: {
+          pair: PairCode;
+          signal: NonNullable<ReturnType<typeof buildDeterministicSignal>>;
+        }[] = [];
+        for (const pair of pairs) {
+          if (at < (busyUntil.get(pair) ?? 0)) {
+            if (first) skippedOpen += 1;
+            continue;
+          }
+          const inWindow = trades.filter(
+            (t) => t.pairCode === pair && Date.parse(t.publishedAt) >= start
           );
+          const last = inWindow[inWindow.length - 1];
+          let requireH1Aligned = false;
+          if (!first) {
+            // Something still pending from this window: no new call.
+            if (last && endOf(last) > at) continue;
+            if (inWindow.length >= MAX_SIGNALS_PER_WINDOW) continue;
+            // rearm: only once the pair's trade in this window has finished.
+            if (use.scans === 'rearm' && !last) continue;
+            // After a loss, cancel or early exit H1 must clearly agree again.
+            requireH1Aligned = Boolean(
+              last && (last.status !== 'HIT' || last.tpHits < 3)
+            );
+          }
+          const history = histories[pair]!;
+          const mtf = Object.fromEntries(
+            (['MONTHLY', 'WEEKLY', ...INTRADAY_TIMEFRAMES] as Timeframe[]).map(
+              (tf) => [tf, closedBy(history[tf] ?? [], tf, at, BARS[tf] ?? 0)]
+            )
+          ) as Record<Timeframe, Candle[]>;
+          if (mtf.M15.length < 20 || mtf.H1.length < 20) continue;
+          const windowEvents = events.filter(
+            (e) =>
+              e.eventDate.getTime() >= at - 30 * 60_000 &&
+              e.eventDate.getTime() <= windowEnd
+          );
+          const signal = buildDeterministicSignal(
+            pair,
+            mtf,
+            windowEvents,
+            window.label,
+            sessionInfo(window.start).playbookHint,
+            new Date(at),
+            {
+              windowEnd: window.end,
+              strict: window.strict,
+              requireH1Aligned,
+              ...engine,
+            }
+          );
+          if (!signal) continue;
+          if (signal.direction === 'NEUTRAL') {
+            if (first) {
+              standAsides += 1;
+              countReason(signal.reasonCode);
+            }
+            continue;
+          }
+          calls.push({ pair, signal });
+        }
+
+        calls.sort((a, b) => b.signal.confidence - a.signal.confidence);
+        for (const { pair, signal } of calls) {
+          // The same setup is not published twice within the cooldown.
+          const key = signal.features.setupKey ?? null;
+          if (
+            key &&
+            trades.some(
+              (t) =>
+                t.setupKey === key &&
+                at - Date.parse(t.publishedAt) < use.setupCooldownMs
+            )
+          ) {
+            countReason('DUPLICATE_SETUP');
+            continue;
+          }
+          const dayStart = day.getTime();
+          const lostToday = use.dailyLossLimit
+            ? trades
+                .filter(
+                  (t) =>
+                    t.filled &&
+                    t.r !== null &&
+                    t.closedAt &&
+                    Date.parse(t.closedAt) >= dayStart &&
+                    Date.parse(t.closedAt) <= at
+                )
+                .reduce((sum, t) => sum + t.r!, 0)
+            : 0;
+          const active = use.usdCap
+            ? trades
+                .filter((t) => Date.parse(t.publishedAt) <= at && endOf(t) > at)
+                .map((t) => ({ pairCode: t.pairCode, direction: t.direction }))
+            : [];
+          const block = portfolioBlock(
+            { pairCode: pair, direction: signal.direction },
+            active,
+            lostToday
+          );
+          if (block) {
+            portfolioBlocked += 1;
+            countReason(block.code);
+            continue;
+          }
+
+          const levels = {
+            pairCode: pair,
+            direction: signal.direction,
+            entryLow: signal.entryLow,
+            entryHigh: signal.entryHigh,
+            targetPrice: signal.targetPrice,
+            invalidationPrice: signal.invalidationPrice,
+            target3Price: finalTarget({ ...signal, pairCode: pair }),
+            entryTrigger: signal.entryTrigger,
+            blackouts: signal.blackouts,
+          };
+          const mid = (levels.entryLow + levels.entryHigh) / 2;
+          const result = simulateTrade(
+            pair,
+            levels,
+            at,
+            windowEnd,
+            histories[pair]!,
+            viewFor(pair)
+          );
+          // Real spread at the fill + slippage on bid/ask history; else the
+          // fixed typical cost.
+          const { fillSpreadPips, ...outcome } = result;
+          const costPips =
+            use.costs && result.filled && result.pips !== null
+              ? fillSpreadPips != null
+                ? Number((fillSpreadPips + SLIPPAGE_PIPS + COMMISSION_PIPS).toFixed(2))
+                : EXECUTION_COST_PIPS[pair]
+              : 0;
+          const pips =
+            result.pips === null ? null : Number((result.pips - costPips).toFixed(1));
+          const r =
+            pips !== null && signal.stopPips > 0
+              ? Number((pips / signal.stopPips).toFixed(2))
+              : null;
+          trades.push({
+            pairCode: pair,
+            session: window.label,
+            direction: signal.direction as 'LONG' | 'SHORT',
+            confidence: signal.confidence,
+            publishedAt: new Date(at).toISOString(),
+            entryLow: levels.entryLow,
+            entryHigh: levels.entryHigh,
+            stop: levels.invalidationPrice,
+            tp1: mid + (mid - levels.invalidationPrice),
+            tp2: levels.targetPrice,
+            tp3: levels.target3Price ?? levels.targetPrice,
+            stopPips: signal.stopPips,
+            ...outcome,
+            pips,
+            costPips,
+            r,
+            features: signal.features,
+            atrPips: signal.atrPips,
+            setupKey: key,
+            scan: first ? 'start' : 'rescan',
+          });
+          // A filled trade blocks new reads on this pair until it closes.
+          if (result.filled)
+            busyUntil.set(
+              pair,
+              result.closedAt
+                ? new Date(result.closedAt).getTime()
+                : Number.MAX_SAFE_INTEGER
+            );
+        }
       }
     }
   }
@@ -1032,7 +1122,15 @@ export async function startBacktest(months: number): Promise<number> {
         previousValue: e.previousValue,
       })) as LiveMarketEvent[];
       const histories = await loadHistories(from, to);
-      const result = simulatePortfolio(histories, events, from, to, liveLevelModel());
+      // The live engine: level model, filters and scan mode.
+      const result = simulatePortfolio(
+        histories,
+        events,
+        from,
+        to,
+        { ...liveLevelModel(), filters: liveFilters() },
+        { scans: liveScanMode() }
+      );
       const trades = result.trades.sort((a, b) =>
         a.publishedAt.localeCompare(b.publishedAt)
       );
@@ -1044,10 +1142,7 @@ export async function startBacktest(months: number): Promise<number> {
           finishedAt: new Date(),
           summary: summary as unknown as Prisma.InputJsonValue,
           trades: trades as unknown as Prisma.InputJsonValue,
-          strategy: strategySnapshot({
-            ...liveLevelModel(),
-            confirmWindowBars: CONFIRM_WINDOW_BARS,
-          }) as unknown as Prisma.InputJsonValue,
+          strategy: liveStrategy() as unknown as Prisma.InputJsonValue,
         },
       });
       console.info(

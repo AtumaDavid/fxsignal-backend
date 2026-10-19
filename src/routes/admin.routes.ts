@@ -513,7 +513,7 @@ router.get(
 );
 
 const analyticsSchema = z.object({
-  source: z.enum(['live', 'backtest']).default('live'),
+  source: z.enum(['live', 'backtest', 'paper']).default('live'),
   dimension: z
     .enum(['pair', 'session', 'direction', 'strategy', 'trigger', 'trend', 'volatility', 'choppy', 'news', 'context', 'confidence'])
     .default('session'),
@@ -566,6 +566,31 @@ router.get(
         ];
       });
       note = `Published signals from the last ${days} days that became positions, in R after the assumed spread + slippage.`;
+    } else if (source === 'paper') {
+      const rows = await prisma.paperSignal.findMany({
+        where: {
+          validFrom: { gte: new Date(Date.now() - days * 86_400_000) },
+          status: { in: ['HIT', 'MISSED', 'EXPIRED'] },
+          r: { not: null },
+        },
+      });
+      trades = rows.map((row) => {
+        const strategy = row.strategy as { version?: string; fingerprint?: string } | null;
+        return {
+          pairCode: row.pairCode,
+          session: row.session,
+          direction: row.direction,
+          r: Number(row.r),
+          status: row.status,
+          closedAt: row.settledAt?.toISOString() ?? null,
+          entryTrigger: row.entryTrigger,
+          strategy: strategy?.version ? `${row.model} ${strategy.version} · ${strategy.fingerprint}` : row.model,
+          features: row.features as ScoredTrade['features'],
+          confidence: row.confidence,
+        };
+      });
+      const pending = await prisma.paperSignal.count({ where: { status: 'PENDING' } });
+      note = `Paper trades of the candidate model from the last ${days} days (recorded live, never published), after the assumed spread + slippage. ${pending} still open. Out of sample by construction — but no H1 checkpoint or portfolio rules.`;
     } else {
       const run = await prisma.backtestRun.findFirst({
         where: { status: 'DONE' },

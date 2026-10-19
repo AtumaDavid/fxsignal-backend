@@ -7,14 +7,27 @@ import type { LiveMarketEvent } from './liveData.js';
 // limit what a trade may cost: execution costs, entries into news, stacking
 // the same USD bet on both pairs, and a bad day.
 
+/** Typical retail spread plus slippage, round trip, in pips. */
+const SPREAD_AND_SLIPPAGE_PIPS: Record<PairCode, number> = {
+  'EUR/USD': 1.2,
+  'USD/JPY': 1.5,
+};
+
 /**
- * Round-trip execution cost per trade, in pips: a typical retail spread plus
- * slippage. Deducted from every filled backtest trade, and built into the
+ * Commission per round trip, in pips. 0 by default: standard accounts charge
+ * through the spread above. For a raw-spread account set COMMISSION_PIPS
+ * (e.g. $7 per lot round turn on EUR/USD ≈ 0.7 pips).
+ */
+export const COMMISSION_PIPS = Math.max(0, Number(process.env.COMMISSION_PIPS ?? 0) || 0);
+
+/**
+ * Round-trip execution cost per trade, in pips: spread + slippage +
+ * commission. Deducted from every filled backtest trade, and built into the
  * target so 2R is 2R after costs.
  */
 export const EXECUTION_COST_PIPS: Record<PairCode, number> = {
-  'EUR/USD': 1.2,
-  'USD/JPY': 1.5,
+  'EUR/USD': Number((SPREAD_AND_SLIPPAGE_PIPS['EUR/USD'] + COMMISSION_PIPS).toFixed(2)),
+  'USD/JPY': Number((SPREAD_AND_SLIPPAGE_PIPS['USD/JPY'] + COMMISSION_PIPS).toFixed(2)),
 };
 
 /** Slippage added on top of a real (bid/ask history) spread. */

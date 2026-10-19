@@ -47,6 +47,9 @@ Local Postgres: `docker compose up -d postgres` from the parent project (or any 
 | `ADMIN_EMAILS` | Comma-separated emails of accounts that can open `/app/admin` |
 | `TWELVE_DATA_CREDITS_PER_DAY` | Daily credit allowance shown on the admin page (default 800, the free plan) |
 | `SIGNAL_LEVEL_MODEL` | `zones` switches live signals to the zone model; default is the ATR entry zone |
+| `SIGNAL_SCANS` | `hourly` re-reads pairs at every H1 close after a stand-aside (London/NY); default `rearm` (only after a closed trade) |
+| `PAPER_LEVEL_MODEL` | Model paper-traded beside live (default `zones`; `off` disables) |
+| `COMMISSION_PIPS` | Round-trip commission in pips for raw-spread accounts (default 0) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME` | Optional Telegram alerts (a free bot from @BotFather); users link from Settings → Alerts |
 | `OANDA_API_TOKEN`, `OANDA_API_URL` | Optional, backtest only: bid/ask history from a free OANDA practice account (default URL `https://api-fxpractice.oanda.com`); use with `HISTORY_SOURCE=oanda npm run backtest:compare` |
 

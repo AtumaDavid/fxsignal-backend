@@ -23,6 +23,8 @@ export interface SignalFeatures {
   contextAligned: boolean;
   /** Live spread at publish (pips), when an MT5 terminal reported one. */
   spreadPips?: number | null;
+  /** Same pair + direction + structure = the same setup (duplicate guard). */
+  setupKey?: string | null;
 }
 
 /** Efficiency ratio of closes over `bars` (oldest first input). */
@@ -35,16 +37,29 @@ export function efficiencyRatio(closes: number[], bars = 20): number | null {
   return path === 0 ? 0 : Number((net / path).toFixed(3));
 }
 
-/** H1 ATR now relative to its median over the last `lookback` closed bars. */
+/**
+ * H1 ATR now relative to its median over the last `lookback` closed bars.
+ * One pass: ATR(14) at each bar is the mean of its last 14 true ranges
+ * (the same definition as technical.atr).
+ */
 export function atrRatio(h1OldestFirst: Candle[], lookback = 100): number | null {
-  if (h1OldestFirst.length < lookback + 15) return null;
-  const now = atr(h1OldestFirst, 14);
-  const past: number[] = [];
-  for (let end = h1OldestFirst.length - lookback; end < h1OldestFirst.length; end += 1) {
-    const a = atr(h1OldestFirst.slice(0, end), 14);
-    if (a !== null) past.push(a);
+  const n = h1OldestFirst.length;
+  if (n < lookback + 15) return null;
+  const tr: number[] = [];
+  for (let i = 1; i < n; i += 1) {
+    const c = h1OldestFirst[i];
+    const pc = h1OldestFirst[i - 1].close;
+    tr.push(Math.max(c.high - c.low, Math.abs(c.high - pc), Math.abs(c.low - pc)));
   }
-  if (now === null || past.length === 0) return null;
+  // atrAt[k]: ATR of the candles [0, k] — mean of tr[k-14 .. k-1].
+  const atrAt = (k: number) => {
+    let sum = 0;
+    for (let j = k - 14; j < k; j += 1) sum += tr[j];
+    return sum / 14;
+  };
+  const now = atrAt(tr.length);
+  const past: number[] = [];
+  for (let end = n - lookback; end < n; end += 1) past.push(atrAt(end - 1));
   past.sort((x, y) => x - y);
   const median = past[Math.floor(past.length / 2)];
   return median > 0 ? Number((now / median).toFixed(2)) : null;
